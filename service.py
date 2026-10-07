@@ -562,6 +562,13 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
     unexpected = _unexpected(args or {}, set())
     if unexpected:
         return unexpected
+    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+        return fail(
+            "plugin_host",
+            "plugins.isolation is host, so this process cannot see Hermes's cron mark. "
+            "This check did not report the devices as unchanged and did not update the cron watch.",
+            "Set plugins.isolation to in_process. The cron watch does not run in the plugin host.",
+        )
     bad = _configured(deps)
     if bad:
         return _notify_watch_failure(deps, bad, advance=advance)
@@ -798,6 +805,12 @@ def canonical_deliver(value: str) -> str | None:
 
 
 def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str:
+    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+        return fail(
+            "plugin_host",
+            "plugins.isolation is host, so this process cannot see Hermes's cron mark. No cron job was created.",
+            "Set plugins.isolation to in_process before scheduling the watch.",
+        )
     bad = _configured(deps)
     if bad:
         return bad

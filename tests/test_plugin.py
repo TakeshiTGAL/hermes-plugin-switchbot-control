@@ -985,6 +985,19 @@ def _capture_cli(handler, args) -> str:
     return buf.getvalue()
 
 
+def test_plugin_host_watch_does_not_report_devices_unchanged(tmp_path, monkeypatch):
+    router = Router()
+    ctx, _service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch)
+    monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "1")
+    body = json.loads(ctx.tools["switchbot_watch"]({}))
+    assert body["ok"] is False
+    assert body["error"] == "plugin_host"
+    assert "unchanged" in body["message"]
+    assert "cron mark" in body["message"]
+    assert not (tmp_path / "watch.json").exists()
+    assert router.calls == []
+
+
 def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
     import asyncio
 
