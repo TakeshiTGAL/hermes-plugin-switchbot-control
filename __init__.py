@@ -123,6 +123,8 @@ def register(ctx) -> None:
         emoji="👀",
     )
 
+    slash_slot = {"sem": None}
+
     def _slash_sync(raw_args: str) -> str:
         parts = (raw_args or "").split()
         cmd = parts[0] if parts else "devices"
@@ -139,11 +141,18 @@ def register(ctx) -> None:
             "Usage: /switchbot-control devices | watch | "
             "schedule <deliver> [schedule] | unschedule. "
             "Put the delivery target first, as in schedule telegram every 10m. "
-            "Commands stay on the switchbot_command tool, which asks for approval."
+            "This slash command does not send a device command. "
+            "Ask with the switchbot_command tool, which asks for approval."
         )
 
     async def _slash(raw_args: str) -> str:
-        return await asyncio.to_thread(_slash_sync, raw_args)
+        # One slash at a time, so a slow call does not fill the shared default executor.
+        sem = slash_slot["sem"]
+        if sem is None:
+            sem = asyncio.Semaphore(1)
+            slash_slot["sem"] = sem
+        async with sem:
+            return await asyncio.to_thread(_slash_sync, raw_args)
 
     ctx.register_command(
         "switchbot-control",
@@ -161,10 +170,8 @@ def register(ctx) -> None:
         )
         scheduled.add_argument("--deliver", default="", help="telegram, discord, slack, local, or platform:chat_id. Required.")
         scheduled.add_argument("--schedule", default=DEFAULT_SCHEDULE, help="No faster than the daily cap allows.")
-        subs.add_parser(
-            "unschedule",
-            help="Remove the cron job. Keeps usage.json, watch.json, and watch_fail.json.",
-        )
+        kept = "Remove the cron job. Keeps usage.json, watch.json, and watch_fail.json."
+        subs.add_parser("unschedule", help=kept, description=kept)
 
     def _cli(args) -> None:
         cmd = getattr(args, "switchbot_command", None) or "devices"

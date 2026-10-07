@@ -13,6 +13,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 PLUGIN_NAME = "switchbot-control"
+# Discord cuts an approval reason at 300 characters. Telegram measures the HTML-escaped form.
+# A question that would be cut is not sent.
+REASON_BUDGET = 300
+
+
+def reason_fits(text: str) -> bool:
+    if len(text) > REASON_BUDGET:
+        return False
+    escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return len(escaped) <= REASON_BUDGET
 
 
 def _load(module: str, name: str) -> tuple[str, Any]:
@@ -77,6 +87,16 @@ def command_block_reason(device_id: str, command: str) -> str | None:
     return None
 
 
+def approval_question(device_id: str, command: str, *, device_name: str, device_type: str, parameter: str, effect: str = "") -> str:
+    """The question, with the command and parameter unchanged."""
+    return (
+        f"Send SwitchBot command {command} to {device_name} "
+        f"(id {device_id}, type {device_type}) with parameter {parameter}. "
+        + (f"{effect} " if effect else "")
+        + "This can move a physical device."
+    )
+
+
 def request_command_approval(
     device_id: str,
     command: str,
@@ -92,16 +112,20 @@ def request_command_approval(
     status, fn = _load("tools.approval", "request_tool_approval")
     if status != "ok":
         return False, "BLOCKED: Hermes approval could not be loaded, so no command was sent."
+    question = approval_question(
+        device_id, command,
+        device_name=device_name, device_type=device_type, parameter=parameter, effect=effect,
+    )
+    if not reason_fits(question):
+        return False, (
+            "BLOCKED: the approval question would be cut off, so it was not sent. "
+            "The command text was not shortened."
+        )
     call_id = uuid.uuid4().hex
     try:
         result = fn(
             "switchbot_command",
-            (
-                f"Send SwitchBot command {command} to {device_name} "
-                f"(id {device_id}, type {device_type}) with parameter {parameter}. "
-                + (f"{effect} " if effect else "")
-                + "This can move a physical device."
-            ),
+            question,
             rule_key=f"switchbot_command:{device_id}:{command}:{parameter}:{call_id}",
         )
     except Exception:

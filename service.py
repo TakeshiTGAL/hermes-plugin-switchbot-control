@@ -59,6 +59,36 @@ CRON_PROMPT = (
 )
 _READING_KEYS = ("temperature", "humidity", "openState", "power", "weight", "electricCurrent", "voltage")
 FAILURE_REMIND_SECONDS = 24 * 3600
+_PROFILE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def _profile_name() -> str:
+    """Active Hermes profile. ``default`` when unset or ``~/.hermes``."""
+    for key in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = os.environ.get(key, "").strip()
+        if value and set(value) <= _PROFILE_CHARS:
+            return value
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return "default"
+    try:
+        path = Path(home).expanduser().resolve()
+        default_home = (Path.home() / ".hermes").resolve()
+    except OSError:
+        return "default"
+    if path == default_home:
+        return "default"
+    if path.parent.name == "profiles" and path.parent.parent == default_home and set(path.name) <= _PROFILE_CHARS:
+        return path.name
+    return "custom"
+
+
+def hermes_cron(verb: str) -> str:
+    """``hermes cron <verb>``, with ``-p <name>`` when the profile is not default."""
+    name = _profile_name()
+    if name and name != "default":
+        return f"hermes -p {name} cron {verb}"
+    return f"hermes cron {verb}"
 
 
 @dataclass
@@ -202,9 +232,11 @@ def _read_usage(deps: Deps) -> dict:
 
 def _write_usage(deps: Deps, usage: dict) -> None:
     path = _usage_path(deps)
+    tmp = path.with_name("usage.json.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(usage), encoding="utf-8")
+        tmp.write_text(json.dumps(usage), encoding="utf-8")
+        os.replace(tmp, path)
     except OSError:
         raise ApiError(
             "bad_usage",
@@ -346,7 +378,7 @@ def command(deps: Deps, args: dict) -> str:
         return fail(
             "host_isolation",
             "Commands are refused while HERMES_PLUGIN_HOST_PROCESS is 1. Nothing was sent.",
-            "Run the command in-process. The watch can still report. No API call was made.",
+            "Set plugins.isolation to in_process. A watch in this process also fails, because the cron mark is not visible. No API call was made.",
         )
     if deps.approver is None:
         blocked = command_block_reason(device_id, command_name)
@@ -389,7 +421,10 @@ def command(deps: Deps, args: dict) -> str:
             effect=curtain_motion(device_type, command_name, command_parameter),
         )
     if not approved:
-        return fail("not_approved", why or "The command was not approved.", "No command POST was made.")
+        extra: dict[str, Any] = {}
+        if why.startswith("BLOCKED: the approval question would be cut off"):
+            extra["retryable"] = False
+        return fail("not_approved", why or "The command was not approved.", "No command POST was made.", **extra)
     try:
         result = _call(
             deps,
@@ -397,9 +432,26 @@ def command(deps: Deps, args: dict) -> str:
             f"/v1.1/devices/{device_id}/commands",
             {"command": command_name, "parameter": command_parameter, "commandType": "command"},
         )
-        warning = _near_cap(deps)
     except ApiError as exc:
         return _shown(deps, fail(exc.code, exc.message, exc.next_step))
+    try:
+        warning = _near_cap(deps)
+    except ApiError:
+        return _public(deps, {
+            "ok": True,
+            "moved": False,
+            "accepted": True,
+            "device_id": device_id,
+            "device_type": device_type,
+            "command": command_name,
+            "statusCode": result.get("statusCode"),
+            "message": (
+                "The API accepted the command (HTTP 200, statusCode 100, message success). "
+                "The daily counter could not be updated after that POST. "
+                "The command may have reached the device."
+            ),
+            "notify": False,
+        })
     message = (
         "The API accepted the command (HTTP 200, statusCode 100, message success). "
         "This plugin did not read the device afterward, so it does not claim the device moved."
@@ -538,10 +590,18 @@ def _notify_watch_failure(deps: Deps, payload: str, *, advance: bool = True) -> 
         body["message"] = (
             text
             + " This check did not update the cron failure record, so the owner's next cron run can still report it."
+            + " This plugin cannot tell whether Hermes delivered a notice."
         )
         return _public(deps, body)
     notify = streak == 0 or last is None or not 0 <= now - last < FAILURE_REMIND_SECONDS
     body["notify"] = notify
+    text = str(body.get("message") or "")
+    body["message"] = (
+        text
+        + " This plugin cannot tell whether Hermes delivered a notice."
+        + " If one was not delivered, the streak stays quiet until the next 24-hour notice."
+        + f" {hermes_cron('list')} shows a run whose result was not delivered."
+    )
     _write_watch_counts(deps, streak + 1, 0, now if notify else last)
     return _public(deps, body)
 
@@ -614,6 +674,7 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
         faults: dict[str, int | str] = {}
         alert_notes: list[str] = []
         quiet_notes: list[str] = []
+        numeric_power_changed = False
         if previous_bad:
             alert_notes.append(
                 "watch.json could not be read, so this tick does not say that nothing changed. "
@@ -651,6 +712,17 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
                 continue
             current = _reading(device_type, status_body)
             prior = None if previous_bad or not isinstance(previous.get(device_id), dict) else previous.get(device_id)
+            if prior is not None and watch_kind(device_type) == "plug":
+                old_power, new_power = prior.get("power"), current.get("power")
+                old_number, new_number = _number(old_power), _number(new_power)
+                if (
+                    old_number is not None
+                    and new_number is not None
+                    and not isinstance(old_power, str)
+                    and not isinstance(new_power, str)
+                    and old_number != new_number
+                ):
+                    numeric_power_changed = True
             alert_notes.extend(f"{device_id}: {note}" for note in _alerts(prior, current, deps))
             readings[device_id] = current
         if path is not None and advance:
@@ -713,11 +785,18 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
         if advance:
             _write_watch_counts(deps, 0, 0)
         verb = "Stored" if advance else "Read"
-        message = (
-            f"{verb} {len(readings)} readings. No meter threshold, contact openState change, "
-            "or plain Plug on/off string change. A numeric power field is not compared. "
-            "Plug Mini on/off is not watched."
-        )
+        if numeric_power_changed:
+            message = (
+                "A numeric power field is not compared. "
+                f"{verb} {len(readings)} readings. No meter threshold or contact openState change was reported. "
+                "Plug Mini on/off is not watched."
+            )
+        else:
+            message = (
+                f"{verb} {len(readings)} readings. No meter threshold, contact openState change, "
+                "or plain Plug on/off string change. A numeric power field is not compared. "
+                "Plug Mini on/off is not watched."
+            )
     if skipped:
         message += f" {skipped} matching devices were not read because max_status_reads is {deps.max_status_reads}."
     if warning:
@@ -744,7 +823,11 @@ def _cron(deps: Deps):
         raise ApiError(
             "no_cron",
             f"Hermes cron is not available ({type(exc).__name__}).",
-            next_step="Create the job with hermes cron create. Point it at switchbot_watch only, no faster than the cap allows.",
+            next_step=(
+                f"Create the job with {hermes_cron('create')}. "
+                "Point the prompt at switchbot_watch only. The toolset still includes switchbot_command, and cron cannot send it. "
+                "No faster than the cap allows."
+            ),
         ) from None
 
 
@@ -862,7 +945,9 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
                     "moved": False,
                     "message": (
                         f"Scheduled new job {created.get('id')}, but the previous job {old.get('id')} is still there. "
-                        "Remove the previous one with hermes cron remove. Watch state was not deleted."
+                        f"Remove the previous one with {hermes_cron('remove')}. "
+                        f"{hermes_cron('list')} only shows jobs. {hermes_cron('status')} shows one job. "
+                        "Watch state was not deleted."
                     ),
                     "job_id": created.get("id"),
                 })
@@ -882,10 +967,12 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}). Results are {where} "
             "The prompt tells the job to call switchbot_watch only. The toolset still includes switchbot_command, and a cron context cannot send a command. "
             "Each slot that runs is at least one model turn, and a turn that calls a tool makes two or more model requests. "
-            "The default every 5 minutes is 288 slots per day. "
+            "The default every 5 minutes is 288 slots per day, and the prompt asks each one to call switchbot_watch, so 576 or more model requests a day. "
             "If a run is still going, Hermes skips the next slot, so a slow watch is not 288 turns. "
             "Hermes skips the agent with no_agent=True, which requires a script, when a script returns wakeAgent=false, or when monitor_script or monitor_url output is unchanged. This plugin passes none of those. "
-            "Removing this plugin does not remove the job."
+            "Removing this plugin does not remove the job. "
+            f"Remove it with hermes switchbot-control unschedule or {hermes_cron('remove')}. "
+            f"{hermes_cron('list')} only shows the job. {hermes_cron('status')} shows one job. "
             + (
                 " bot-chat delivery starts one model turn, and the agent can act on that text."
                 if "bot-chat" in target.lower() else ""
@@ -906,7 +993,11 @@ def unschedule(deps: Deps) -> str:
     except ApiError as exc:
         return _shown(deps, fail(exc.code, exc.message, exc.next_step))
     except Exception as exc:
-        return fail("no_cron", f"Could not remove the job ({type(exc).__name__}).", "Use hermes cron list to see it, then hermes cron remove, or hermes switchbot-control unschedule.")
+        return fail(
+            "no_cron",
+            f"Could not remove the job ({type(exc).__name__}).",
+            f"Use {hermes_cron('list')} to see it, {hermes_cron('status')} to inspect it, then {hermes_cron('remove')}, or hermes switchbot-control unschedule.",
+        )
     return dumps({
         "ok": True,
         "moved": False,

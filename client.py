@@ -94,7 +94,19 @@ class SwitchBot:
         try:
             return self._request(method, path, body)
         except ApiError as err:
-            if method == "POST" and _post_may_have_run(err):
+            if method == "POST" and err.status_code in {161, 171}:
+                if err.status_code == 161:
+                    err.message = (
+                        "The device is offline (statusCode 161). "
+                        "This plugin does not say the command moved the device."
+                    )
+                else:
+                    err.message = (
+                        "The hub is offline (statusCode 171). "
+                        "This plugin does not say the command moved the device."
+                    )
+                err.next_step = "Check the device or its hub. No retry was made."
+            elif method == "POST" and _post_may_have_run(err):
                 err.message = f"{err.message} {MAY_HAVE_MOVED}"
                 err.next_step = CHECK_BEFORE_RESEND
             raise
