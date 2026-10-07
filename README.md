@@ -1,0 +1,66 @@
+# switchbot-control
+
+Hermes tools for the SwitchBot cloud OpenAPI (`api.switch-bot.com`, v1.1). Built on that API. This is not a SwitchBot product, and it does not use Home Assistant. Hermes has a separate Home Assistant plugin. This one does not speak BLE. The catalog card's local BLE path is a different route. Teknium's card says the cloud OpenAPI "requires a SwitchBot Hub plus Cloud Service enabled for BLE devices." The SwitchBot API README says the same for BLE devices, and Beyond V9.0 it names that menu Third-party Services. This plugin does not enable that setting. The live check's empty list was an account with zero devices. This plugin cannot tell that apart from the setting being off. SwitchBot is a trademark of its owner.
+
+Authentication and error shapes were checked against the live SwitchBot API. Device status and commands follow the published examples and were not confirmed on hardware.
+
+認証とエラーの形は実際の API で確かめた。機器の状態と操作は仕様の実例によるもので、実機では未確認。
+
+## What it does
+
+1. `switchbot_devices` lists physical devices and infrared remotes. An optional `device_id` also reads that device's status. It reports the list from that call and does not compare it with an earlier list, so a drop to zero is a successful empty list. Only `switchbot_watch` says when a previous watch file still has rows.
+2. `switchbot_command` sends one command from a fixed list, after Hermes approval.
+3. `switchbot_watch` reads meters, contact sensors, and plugs. It reports the plain Plug `power` string, not Plug Mini on or off. The cron prompt tells the job to call this tool only. The toolset still contains `switchbot_command`, and a cron context cannot send a command.
+
+## Signing
+
+The sign that the live API accepted is the Python 3 example in the [SwitchBotAPI README](https://github.com/OpenWonderLabs/SwitchBotAPI): base64 of HMAC-SHA256 over `token + timestamp + nonce`, keyed with the secret. Headers are `Authorization`, `sign`, `t`, and `nonce`. The short uppercase `token + timestamp` example in that README was not sent.
+
+On 2026-10-06, with an account that had zero devices, these responses came back. The token and secret are not in this repository.
+
+| Call | Result |
+|---|---|
+| Signed `GET /v1.1/devices` | HTTP 200, `statusCode` 100, `message` `success`, `deviceList` 0, `infraredRemoteList` 0 |
+| Wrong token, wrong secret, wrong `sign`, or a timestamp 10 minutes old | HTTP 401, JSON `{"message": "Unauthorized"}`, no `statusCode` |
+| `GET /v1.1/devices/000000000000/status` | HTTP 200, `statusCode` 100, `message` `success`, `body` `{}` |
+| `POST` `turnOn` to that same id | HTTP 200, `statusCode` 190, `message` `Wrong deviceId, No this device`, `body` `{}` |
+
+An empty status body is not reported as a device state. `statusCode` other than 100 is not success, including 190 on HTTP 200. A redirect is not followed. Each call times out at 20 seconds. There is no retry. A body over 1000000 bytes is discarded. A watch tick makes at most 21 calls. If every call uses the full 20 second timeout, that is about 420 seconds. That figure is an estimate, not a cap. A command that is sent waits 20 seconds for the device list, then Hermes's approval wait, then 20 seconds for the command. That wait is `approvals.timeout`, and the default is 300 seconds, which is about 340 seconds. That figure is an estimate, not a cap. This plugin does not cap that setting. Raising it makes the command wait longer.
+
+## Commands
+
+Allowed, with parameter `default`: `turnOn`, `turnOff`, `press`, `pause`, `volumeAdd`, `volumeSub`, `channelAdd`, `channelSub`, `setMute`, `FastForward`, `Rewind`, `Next`, `Previous`, `Pause`, `Play`, `Stop`.
+
+Also allowed when the parameter matches a published v1.1 table: `setPosition`, `setAll`, and `SetChannel` (digits). `setPosition` is the Curtain and Curtain 3 form, `0,ff,0` through `0,ff,100`, with mode `0`, `1`, or `ff`. It is not on the infrared table. Blind Tilt's `up;60` and Roller Shade's `0` through `100` do not match that form, so they are refused. `setPosition` is sent only when the device type is `Curtain` or `Curtain3`. 0 is open and 100 is closed. `setAll` and `SetChannel` are on the infrared table. For `setAll`, that table says modes `0` and `1` are auto, then `2` cool, `3` dry, `4` fan, and `5` heat. Fan speed `1` is auto, `2` low, `3` medium, and `4` high. The example is `26,1,3,on`. Temperature is Celsius. The table does not publish a minimum or maximum, so this plugin accepts `0` through `40`.
+
+`lock`, `unlock`, and `deadbolt` are refused unless config `safety_devices` is true. A device whose type token is lock, keypad, garage, or door is refused the same way, including `turnOn` on that device. User-defined infrared buttons (`commandType` `customize`) are refused. Anything else is refused. The check happens before a command POST.
+
+Every allowed command still asks Hermes. Each call uses a new approval rule, so a previous always or session choice does not cover the next call. Choosing always writes one unused line into Hermes `config.yaml` `command_allowlist` on every call. Choose once. The plugin reads `request_tool_approval` and requires `approved` to be true. The approval text names the device, its type, and the parameter. It does not change or cap Hermes's approval wait. The default `approvals.timeout` is 300 seconds. A higher value makes a sent command wait longer. Cron, yolo, approvals off, a single-query session, an unattended session, or a missing, renamed, or raising helper sends nothing. This plugin has no allowlist of its own. Hermes still applies its gateway rule: an empty platform allowlist denies the sender, except a per-platform allow-all, an approved pairing, a platform's own access check, or `GATEWAY_ALLOW_ALL_USERS`. A person who can already talk to the agent can request a command, and the approval happens in that chat.
+
+The slash command is `/switchbot-control`. It can list devices, run one watch, or schedule and unschedule. It does not send a device command. The CLI is `hermes switchbot-control` with `devices`, `watch`, `schedule`, and `unschedule`. Hermes `plugins.isolation: host` does not register that CLI. The default is `in_process`, where the CLI is registered. The slash command remains either way.
+
+`accepted: true` means the API returned HTTP 200, `statusCode` 100, and `message` `success`. `moved` stays false. The plugin does not read the device after the command, so it does not claim the device moved.
+
+## Watch and the daily cap
+
+The published personal cap is 10000 calls per day. The SwitchBot README says going over that limit returns Unauthorized. A 401 from this plugin therefore also tells you to check that account-wide cap. The over-cap body was not observed on the live checks. It counts its own calls on a UTC date, in `usage.json`, and writes the new count before the call. It cannot raise the cap. The first result that sees the remaining count at or below `warn_remaining` (default 1000) says so once that UTC day. SwitchBot's own reset timezone was not measured.
+
+One watch tick is one device list plus up to `max_status_reads` status reads (default 8, hard max 20). A repeating cron schedule is refused unless this plugin can prove it is slow enough that those calls fit in the cap, and never faster than every 120 seconds. The default schedule is `*/5 * * * *`, which is 288 schedule slots per day. Each cron run costs one model turn. At the default of every 5 minutes, that is at most 288 model turns a day. A slot that runs is one Hermes agent turn. If that run is still going, Hermes skips the next slot, so a slow watch does not produce 288 turns. `create_job` skips the agent with `no_agent=True` (that mode requires a script), when a script returns `wakeAgent=false`, or when `monitor_script` or `monitor_url` output is unchanged. This plugin passes none of those. One-shot delays are not a repeating load. The cron prompt tells the job to call `switchbot_watch` only. The toolset still contains `switchbot_command`, and a cron context cannot send a command.
+
+Meter types follow the OpenAPI list names, including `Meter`, `MeterPlus`, `MeterPro`, `MeterPro(CO2)`, and `WoIOSensor` (Outdoor Meter). `Hub 2` can report temperature, and this plugin does not treat that hub as a meter. Contact is `Contact Sensor`. Plugs are types whose name contains `Plug`.
+
+Meter alerts use `temperature_high_c`, `temperature_low_c`, and `humidity_high_pct` only when those strings are numbers. A non-number stops the tool before any API call. Contact `openState` and the plain Plug `power` string are reported only after a change from the previous sample. That `power` string is on the Plug status table. Plug Mini (US) and Plug Mini (JP) status tables do not publish `power` or `powerState`. `powerState` is on their webhook tables, and this plugin does not receive webhooks, so it does not report those plugs turning on or off. Plug Mini (EU) on/off is `switchStatus`, which this plugin does not read. That device's `power` field is watts, a number. This plugin compares `power` only when it is a string, so a change in that number is not reported. Plug `weight` is the OpenAPI field described as power consumed in a day, in watts, and alerts only when `plug_weight_watts` is set and the value crosses it. A plug with no `power` string and no weight threshold produces no power alert.
+
+If `watch.json` cannot be read, the tick says so and does not claim that nothing changed. If the previous file had device rows and this list has no meter, contact, or plug, the tick says the account is not a normal empty one. It does not delete those rows.
+
+`watch.json` stores the device id, device type, and the fields that were read (temperature, humidity, openState, power, weight, electricCurrent, voltage). It also stores `faults` (device id and statusCode) and `list_gap` when the list has none of those devices but older rows remain. It does not store `powerState`. It does not store the token, the secret, or the device name. The chat still contains the tool result. The device list in that result includes names the API returned. At most 200 rows are kept.
+
+## Disclosure —
+
+One SwitchBot account, from `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET`. No BLE. No Home Assistant. No plugin allowlist. An empty Hermes gateway allowlist denies the sender, except a per-platform allow-all, an approved pairing, a platform's own access check, or `GATEWAY_ALLOW_ALL_USERS`. Approval for a command is in that chat. While `HERMES_PLUGIN_HOST_PROCESS` is 1, commands are refused and no command API call is made. The slash command is `/switchbot-control`. The CLI is `hermes switchbot-control`. Cron cannot send a command. The SwitchBot API README limits this API to personal use and prohibits commercial use and large-scale applications. A watch failure (unauthorized, the daily cap, a broken counter, and the other watch errors) sets `notify` true on the first failure of a streak and false on the later ones. A later successful watch starts the streak over. An empty watch list (no meter, contact, or plug) notifies once per empty stretch and says that Cloud Services being off looks the same. Later quiet ticks of that stretch are not a healthy watch. A watch failure clears that empty count, so the next empty list notifies again. A device statusCode such as 161, 171, 190, or 152 is a note for that device and does not stop the tick. The same status on the next tick does not notify again. A 401, the daily cap, or a network failure stops the tick. If the previous file still has rows and the list has no meter, contact, or plug, that notice is sent once, until the list has those devices again. The agent can call the tools itself. There is no child process, so this is not a sandbox for untrusted code. No price list is fetched. Private modules (`tools.approval`, `tools.approval_context`, `cron.jobs`, `plugins.plugin_storage`) fail closed: if one is missing, renamed, or raises, no command is sent. `tests/` is shipped and is not loaded by `register()`. Removing the plugin leaves the cron job, `usage.json`, `watch.json`, and `watch_fail.json` (the failure streak). Remove the job with `hermes switchbot-control unschedule` or `hermes cron remove`. `hermes cron list` only shows the job. Delete the `switchbot-control` plugin-data directory to remove those files.
+
+## Checked, and not checked
+
+Checked on the live API: a correct signature, a wrong token, a wrong secret, a wrong signature, a timestamp 10 minutes old, an unknown device status, an unknown device command, and an empty device list.
+
+Not checked on hardware: meter, contact, and plug readings, and every command. Those parsers follow the examples in the SwitchBotAPI repository. The account used for the live checks had no devices.

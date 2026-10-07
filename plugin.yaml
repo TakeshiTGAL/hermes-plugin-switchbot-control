@@ -1,0 +1,87 @@
+name: switchbot-control
+version: 0.1.0
+manifest_version: 2
+requires_hermes: ">=0.21.4"
+description: >-
+  Built on the SwitchBot OpenAPI v1.1. Lists devices and infrared remotes,
+  reads a device status, and sends only a fixed list of commands after
+  Hermes approval. Lock, unlock, deadbolt, and lock, keypad, garage, or door
+  device types stay off unless safety_devices is enabled. A cron watch reports
+  meter thresholds, contact changes, and the plain Plug power field.
+  It does not report Plug Mini on or off, and it does not send commands.
+  This plugin does not use Home Assistant or BLE.
+author: TakeshiTGAL
+license: MIT
+homepage: https://github.com/TakeshiTGAL/hermes-plugin-switchbot-control
+tags: [switchbot, openapi, sensors, cron]
+provides_tools:
+  - switchbot_devices
+  - switchbot_command
+  - switchbot_watch
+requires_env:
+  - name: SWITCHBOT_TOKEN
+    description: "Open token from the SwitchBot app. Sent only as the Authorization header."
+    prompt: "SwitchBot open token"
+    secret: true
+    password: true
+  - name: SWITCHBOT_SECRET
+    description: "Secret key from the SwitchBot app. Used only to sign requests. Never logged."
+    prompt: "SwitchBot secret key"
+    secret: true
+    password: true
+config_schema:
+  safety_devices:
+    type: bool
+    default: false
+    label: Allow lock and door commands
+    description: >-
+      Off by default. When false, lock, unlock, deadbolt, and any device whose
+      type is a lock, keypad, garage, or door are refused before a command is sent.
+      When true, those commands still ask Hermes for approval every time.
+      Each call uses a new approval rule, so a previous always or session choice does not cover the next call.
+      A tool argument cannot turn this on.
+  daily_cap:
+    type: int
+    default: 10000
+    label: API calls per UTC day
+    description: >-
+      Clamped to 1-10000. The published personal cap is 10000 calls per day.
+      This plugin cannot raise that. The counter is this plugin's own UTC-day
+      count, written before each call. Tool arguments cannot change it.
+  warn_remaining:
+    type: int
+    default: 1000
+    label: Warn when this many calls remain
+    description: >-
+      Clamped to 0-10000. The first result that sees the remaining count at or
+      below this number says so once that UTC day. Tool arguments cannot change it.
+  max_status_reads:
+    type: int
+    default: 8
+    label: Status reads per watch
+    description: >-
+      Clamped to 1-20. One watch tick is one device list plus up to this many
+      status reads. The cron schedule must be slow enough that those calls fit
+      in the daily cap. Tool arguments cannot raise it.
+  temperature_high_c:
+    type: string
+    default: ""
+    label: High temperature
+    description: Celsius. Empty means no high-temperature alert. A value that is not a number stops the watch before any API call.
+  temperature_low_c:
+    type: string
+    default: ""
+    label: Low temperature
+    description: Celsius. Empty means no low-temperature alert.
+  humidity_high_pct:
+    type: string
+    default: ""
+    label: High humidity
+    description: Percent. Empty means no humidity alert.
+  plug_weight_watts:
+    type: string
+    default: ""
+    label: Plug daily watts
+    description: >-
+      Empty means no alert on the plug "weight" field. The OpenAPI describes
+      that field as power consumed in a day, in watts.
