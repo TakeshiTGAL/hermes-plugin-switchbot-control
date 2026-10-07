@@ -70,6 +70,42 @@ def curtain_position_allowed(device_type: str) -> bool:
     return device_type in {"Curtain", "Curtain3"}
 
 
+def curtain_motion(device_type: str, command: str, parameter: str) -> str:
+    """What a Curtain or Curtain 3 command does, from the published curtain tables.
+
+    turnOn is position 0 (open) and turnOff is position 100 (closed). Other device
+    types get an empty string, so their approval text names only the command.
+    """
+    if not curtain_position_allowed(device_type):
+        return ""
+    if command == "turnOn":
+        return "This will open the curtain (position 0)."
+    if command == "turnOff":
+        return "This will close the curtain (position 100)."
+    if command == "setPosition":
+        match = _POSITION.fullmatch(parameter or "")
+        if match:
+            return f"This will move the curtain to position {int(match.group(2))} (0 is open, 100 is closed)."
+    return ""
+
+
+_SCHEDULE_WORDS = frozenset({
+    "every", "in", "at", "once", "daily", "hourly", "weekly", "monthly", "yearly", "annually",
+    "weekday", "weekdays", "weekend", "weekends", "midnight", "noon",
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+})
+
+
+def deliver_looks_like_schedule(deliver: str) -> bool:
+    """True when the delivery target is really the start of a schedule, as in 'every 5m'."""
+    text = deliver.strip()
+    if not text:
+        return False
+    lower = text.lower()
+    return lower in _SCHEDULE_WORDS or text[0] in "0123456789*@"
+
+
 def prepare_command(command: str, parameter: str | None) -> tuple[str, str] | str:
     if command in DEFAULT_COMMANDS or command in SAFETY_COMMANDS:
         if parameter in {None, "", "default"}:

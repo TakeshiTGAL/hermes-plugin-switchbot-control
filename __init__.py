@@ -130,7 +130,8 @@ def register(ctx) -> None:
             return unschedule(_deps())
         return (
             "Usage: /switchbot-control devices | watch | "
-            "schedule <deliver> [cron expression] | unschedule. "
+            "schedule <deliver> [schedule] | unschedule. "
+            "Put the delivery target first, as in schedule telegram every 10m. "
             "Commands stay on the switchbot_command tool, which asks for approval."
         )
 

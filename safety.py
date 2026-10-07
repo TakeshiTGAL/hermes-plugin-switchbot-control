@@ -84,6 +84,7 @@ def request_command_approval(
     device_name: str,
     device_type: str,
     parameter: str,
+    effect: str = "",
 ) -> tuple[bool, str]:
     reason = command_block_reason(device_id, command)
     if reason:
@@ -98,7 +99,8 @@ def request_command_approval(
             (
                 f"Send SwitchBot command {command} to {device_name} "
                 f"(id {device_id}, type {device_type}) with parameter {parameter}. "
-                "This can move a physical device."
+                + (f"{effect} " if effect else "")
+                + "This can move a physical device."
             ),
             rule_key=f"switchbot_command:{device_id}:{command}:{parameter}:{call_id}",
         )

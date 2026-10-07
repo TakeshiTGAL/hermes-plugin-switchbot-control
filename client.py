@@ -30,6 +30,11 @@ from typing import Any, Callable, Mapping
 HOST = "https://" + "api.switch-bot.com"
 TIMEOUT_SECONDS = 20.0
 MAX_BYTES = 1_000_000
+MAY_HAVE_MOVED = "The command may have reached the device and moved it."
+CHECK_BEFORE_RESEND = (
+    "No retry was made. Check the device state first, with switchbot_devices and that device_id "
+    "or by looking at the device. Send the command again only if it did not move."
+)
 
 Transport = Callable[[str, str, Mapping[str, str], bytes | None, float, int], tuple[int, Mapping[str, str], bytes]]
 
@@ -86,6 +91,15 @@ class SwitchBot:
         self.now = now or time.time
 
     def request(self, method: str, path: str, body: dict | None = None) -> dict:
+        try:
+            return self._request(method, path, body)
+        except ApiError as err:
+            if method == "POST" and _post_may_have_run(err):
+                err.message = f"{err.message} {MAY_HAVE_MOVED}"
+                err.next_step = CHECK_BEFORE_RESEND
+            raise
+
+    def _request(self, method: str, path: str, body: dict | None = None) -> dict:
         if not path.startswith("/v1.1/") or ".." in path:
             raise ApiError("bad_path", "This plugin only calls SwitchBot v1.1 device paths.", next_step="Use a device id from the account list.")
         timestamp_ms = int(self.now() * 1000)
@@ -159,3 +173,18 @@ class SwitchBot:
                 next_step="This plugin does not treat that as success.",
             )
         return parsed
+
+
+def _post_may_have_run(err: ApiError) -> bool:
+    """False only when the reply says the command was not run.
+
+    That is a path this plugin refused before sending, an Unauthorized reply, or
+    an HTTP 4xx other than 408. Everything else (a timeout, a 5xx, a body that is
+    not JSON, a redirect, or HTTP 200 with a statusCode other than 100) may have
+    reached the device.
+    """
+    if err.code in {"bad_path", "unauthorized"}:
+        return False
+    if isinstance(err.http, int) and 400 <= err.http < 500 and err.http != 408:
+        return False
+    return True

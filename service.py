@@ -18,7 +18,9 @@ if __package__:
         MAX_STATUS_HI,
         SAFETY_COMMANDS,
         calls_per_tick,
+        curtain_motion,
         curtain_position_allowed,
+        deliver_looks_like_schedule,
         is_safety_type,
         min_gap_seconds,
         prepare_command,
@@ -35,7 +37,9 @@ else:
         MAX_STATUS_HI,
         SAFETY_COMMANDS,
         calls_per_tick,
+        curtain_motion,
         curtain_position_allowed,
+        deliver_looks_like_schedule,
         is_safety_type,
         min_gap_seconds,
         prepare_command,
@@ -54,6 +58,7 @@ CRON_PROMPT = (
     "If notify is false, reply with NO_REPLY."
 )
 _READING_KEYS = ("temperature", "humidity", "openState", "power", "weight", "electricCurrent", "voltage")
+FAILURE_REMIND_SECONDS = 24 * 3600
 
 
 @dataclass
@@ -363,7 +368,7 @@ def command(deps: Deps, args: dict) -> str:
     if command_name == "setPosition" and not curtain_position_allowed(device_type):
         return fail(
             "bad_command",
-            f"setPosition is sent only for Curtain and Curtain3. This device is {device_type or 'unknown'}. 0 is open and 100 is closed. Nothing was sent.",
+            f"setPosition is sent only for Curtain and Curtain3. This device is {device_type or 'unknown'}. Nothing was sent.",
             "Blind Tilt and Roller Shade are refused. No command POST was made.",
         )
     if is_safety_type(device_type) and not deps.safety_devices:
@@ -381,6 +386,7 @@ def command(deps: Deps, args: dict) -> str:
             device_name=device_name,
             device_type=device_type,
             parameter=command_parameter,
+            effect=curtain_motion(device_type, command_name, command_parameter),
         )
     if not approved:
         return fail("not_approved", why or "The command was not approved.", "No command POST was made.")
@@ -480,26 +486,32 @@ def _count(loaded: dict, key: str) -> int:
 
 
 def _read_watch_counts(deps: Deps) -> tuple[int, int]:
-    path = _watch_fail_path(deps)
-    if path is None or not path.exists():
-        return 0, 0
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return 0, 0
-    if not isinstance(loaded, dict):
-        return 0, 0
+    loaded = _read_watch_fail(deps)
     return _count(loaded, "streak"), _count(loaded, "empty")
 
 
-def _write_watch_counts(deps: Deps, streak: int, empty: int) -> None:
+def _read_watch_fail(deps: Deps) -> dict:
+    path = _watch_fail_path(deps)
+    if path is None or not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _write_watch_counts(deps: Deps, streak: int, empty: int, notified_at: float | None = None) -> None:
     path = _watch_fail_path(deps)
     if path is None:
         return
+    row: dict[str, Any] = {"streak": streak, "empty": empty}
+    if notified_at is not None:
+        row["notified_at"] = notified_at
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name("watch_fail.json.tmp")
-        tmp.write_text(json.dumps({"streak": streak, "empty": empty}), encoding="utf-8")
+        tmp.write_text(json.dumps(row), encoding="utf-8")
         os.replace(tmp, path)
     except OSError:
         return
@@ -512,14 +524,25 @@ def _notify_watch_failure(deps: Deps, payload: str) -> str:
         body = {"ok": False, "moved": False, "message": payload}
     if not isinstance(body, dict):
         body = {"ok": False, "moved": False, "message": payload}
-    streak, _empty = _read_watch_counts(deps)
-    body["notify"] = streak == 0
-    _write_watch_counts(deps, streak + 1, 0)
+    loaded = _read_watch_fail(deps)
+    streak = _count(loaded, "streak")
+    now = deps.now()
+    last = loaded.get("notified_at")
+    if isinstance(last, bool) or not isinstance(last, (int, float)):
+        last = None
+    # A streak stays quiet for 24 hours after its last notice, then notifies again.
+    # A missing time, or one in the future, notifies now.
+    notify = streak == 0 or last is None or not 0 <= now - last < FAILURE_REMIND_SECONDS
+    body["notify"] = notify
+    _write_watch_counts(deps, streak + 1, 0, now if notify else last)
     return _public(deps, body)
 
 
 def watch(deps: Deps, args: dict) -> str:
-    bad = _unexpected(args or {}, set()) or _configured(deps)
+    unexpected = _unexpected(args or {}, set())
+    if unexpected:
+        return unexpected
+    bad = _configured(deps)
     if bad:
         return _notify_watch_failure(deps, bad)
     try:
@@ -708,6 +731,14 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "No delivery target was given, so no cron job was created.",
             "Pass a Hermes deliver target such as telegram, discord, slack, or local.",
         )
+    if deliver_looks_like_schedule(deliver):
+        return fail(
+            "deliver_looks_like_schedule",
+            f"'{deliver.strip()}' looks like the start of a schedule, not a delivery target, so no cron job was created.",
+            "Put the delivery target first, then the schedule: /switchbot-control schedule telegram every 10m, "
+            "or /switchbot-control schedule local */5 * * * *. "
+            "From the CLI: hermes switchbot-control schedule --deliver telegram --schedule \"every 10m\".",
+        )
     floor = min_gap_seconds(deps.max_status_reads, deps.daily_cap)
     refusal = schedule_refusal(when, floor)
     if refusal:
@@ -752,7 +783,8 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
         "message": (
             f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}). Results are {where} "
             "The prompt tells the job to call switchbot_watch only. The toolset still includes switchbot_command, and a cron context cannot send a command. "
-            "Each slot that runs is one agent turn. The default every 5 minutes is 288 slots per day. "
+            "Each slot that runs is at least one model turn, and a turn that calls a tool makes two or more model requests. "
+            "The default every 5 minutes is 288 slots per day. "
             "If a run is still going, Hermes skips the next slot, so a slow watch is not 288 turns. "
             "Hermes skips the agent with no_agent=True, which requires a script, when a script returns wakeAgent=false, or when monitor_script or monitor_url output is unchanged. This plugin passes none of those. "
             "Removing this plugin does not remove the job."

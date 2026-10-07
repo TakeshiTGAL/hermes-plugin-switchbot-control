@@ -656,3 +656,229 @@ def test_watch_failure_notifies_only_the_first_of_a_streak(tmp_path):
     router.add("/v1.1/devices", 401, UNAUTHORIZED)
     again = json.loads(watch(plugin, {}))
     assert again["notify"] is True
+
+
+@pytest.mark.parametrize("first", ["every", "Every", "in", "5m", "10", "*/5", "@daily", "monday", "daily"])
+def test_schedule_refuses_a_schedule_word_as_the_delivery_target(first, tmp_path):
+    from service import slash_schedule_args
+
+    created = []
+
+    class Jobs:
+        def list_jobs(self, include_disabled=True):
+            return []
+
+        def create_job(self, **kwargs):
+            created.append(kwargs)
+            return {"id": "job1"}
+
+    when, deliver = slash_schedule_args(["schedule", first, "5m"])
+    out = json.loads(schedule(deps(tmp_path, cron_module=Jobs()), when, deliver))
+    assert out["ok"] is False
+    assert out["error"] == "deliver_looks_like_schedule"
+    assert "schedule telegram every 10m" in out["next_step"]
+    assert created == []
+
+
+def test_schedule_still_accepts_a_real_delivery_target(tmp_path):
+    from service import slash_schedule_args
+
+    class Jobs:
+        def list_jobs(self, include_disabled=True):
+            return []
+
+        def create_job(self, **kwargs):
+            return {"id": "job1", "schedule_display": kwargs["schedule"], "deliver": kwargs["deliver"]}
+
+    for parts in (["schedule", "telegram", "every", "10m"], ["schedule", "discord:123", "*/5", "*", "*", "*", "*"]):
+        when, deliver = slash_schedule_args(parts)
+        out = json.loads(schedule(deps(tmp_path, cron_module=Jobs()), when, deliver))
+        assert out["ok"] is True
+        assert out["deliver"] == parts[1]
+
+
+def test_bad_number_config_stops_list_command_watch_and_schedule(tmp_path):
+    router = Router()
+    plugin = deps(tmp_path, router, config_problem="temperature_high_c is not a number, so no API call was made.")
+    for out in (
+        devices(plugin, {}),
+        command(plugin, {"device_id": "BOT1", "command": "press"}),
+        watch(plugin, {}),
+        schedule(plugin, "*/5 * * * *", "local"),
+    ):
+        body = json.loads(out)
+        assert body["ok"] is False
+        assert body["error"] == "bad_config"
+    assert router.calls == []
+
+
+def test_watch_bad_arguments_do_not_start_a_failure_streak(tmp_path):
+    router = Router()
+    router.add("/v1.1/devices", 401, UNAUTHORIZED)
+    plugin = deps(tmp_path, router)
+    wrong = json.loads(watch(plugin, {"device_id": "X"}))
+    assert wrong["ok"] is False
+    assert wrong["error"] == "bad_args"
+    assert wrong.get("notify") is not True
+    assert not (tmp_path / "watch_fail.json").exists()
+    assert router.calls == []
+    first_real = json.loads(watch(plugin, {}))
+    assert first_real["notify"] is True
+
+
+def _approval_reasons(monkeypatch):
+    asked = []
+
+    def approval(_tool, reason, rule_key=""):
+        asked.append(reason)
+        return {"approved": True}
+
+    def fake(_module, attr):
+        if attr == "_get_approval_mode":
+            return "ok", (lambda: "manual")
+        if attr == "request_tool_approval":
+            return "ok", approval
+        return "ok", (lambda: False)
+
+    monkeypatch.setattr(safety, "_load", fake)
+    return asked
+
+
+def test_curtain_approval_says_turn_off_closes_and_turn_on_opens(tmp_path, monkeypatch):
+    asked = _approval_reasons(monkeypatch)
+    router = Router()
+    router.add("/commands", 200, COMMAND_OK)
+    router.add("/v1.1/devices", 200, _list([
+        {"deviceId": "CUR1", "deviceType": "Curtain3", "deviceName": "Left"},
+        {"deviceId": "BOT1", "deviceType": "Bot", "deviceName": "Coffee"},
+    ]))
+    plugin = deps(tmp_path, router, approver=None)
+    for device_id, name, parameter in (
+        ("CUR1", "turnOff", None),
+        ("CUR1", "turnOn", None),
+        ("CUR1", "setPosition", "0,ff,30"),
+        ("BOT1", "turnOff", None),
+    ):
+        args = {"device_id": device_id, "command": name}
+        if parameter:
+            args["parameter"] = parameter
+        assert json.loads(command(plugin, args))["ok"] is True
+    assert "close the curtain (position 100)" in asked[0]
+    assert "open the curtain (position 0)" in asked[1]
+    assert "position 30 (0 is open, 100 is closed)" in asked[2]
+    assert "curtain" not in asked[3]
+
+
+def test_blind_tilt_refusal_does_not_give_the_curtain_direction(tmp_path):
+    router = Router()
+    router.add("/v1.1/devices", 200, _list([{"deviceId": "BT1", "deviceType": "Blind Tilt", "deviceName": "Study"}]))
+    out = json.loads(command(deps(tmp_path, router), {"device_id": "BT1", "command": "setPosition", "parameter": "0,ff,0"}))
+    assert out["ok"] is False
+    assert "Blind Tilt" in out["message"]
+    assert "0 is open" not in out["message"] + out["next_step"]
+    assert not any(call["method"] == "POST" for call in router.calls)
+
+
+def test_command_post_timeout_says_it_may_have_moved(tmp_path):
+    calls = []
+
+    def transport(method, url, headers, body, timeout, read_limit):
+        calls.append(method)
+        if method == "POST":
+            raise TimeoutError("timed out")
+        return 200, {}, body_of(**_list([{"deviceId": "BOT1", "deviceType": "Bot", "deviceName": "Coffee"}]))
+
+    out = json.loads(command(deps(tmp_path, transport), {"device_id": "BOT1", "command": "press"}))
+    assert out["ok"] is False
+    assert out["error"] == "network"
+    assert "may have reached the device" in out["message"]
+    assert "Check the device state first" in out["next_step"]
+    assert "try again later" not in out["next_step"]
+    assert calls == ["GET", "POST"]
+
+
+def test_list_timeout_is_still_a_plain_network_failure(tmp_path):
+    def transport(method, url, headers, body, timeout, read_limit):
+        raise TimeoutError("timed out")
+
+    out = json.loads(devices(deps(tmp_path, transport), {}))
+    assert out["error"] == "network"
+    assert "may have" not in out["message"]
+
+
+def _post_reply(status, payload: bytes):
+    calls = []
+
+    def transport(method, url, headers, body, timeout, read_limit):
+        calls.append(method)
+        if method == "POST":
+            return status, {}, payload
+        return 200, {}, body_of(**_list([{"deviceId": "BOT1", "deviceType": "Bot", "deviceName": "Coffee"}]))
+
+    return transport, calls
+
+
+@pytest.mark.parametrize("status,payload", [
+    (502, b"<html>Bad Gateway</html>"),
+    (504, b'{"message": "Gateway Timeout"}'),
+    (200, b"<html>not json</html>"),
+    (200, body_of(**MISSING_COMMAND)),
+])
+def test_unclear_command_reply_says_it_may_have_moved(status, payload, tmp_path):
+    transport, calls = _post_reply(status, payload)
+    out = json.loads(command(deps(tmp_path, transport), {"device_id": "BOT1", "command": "press"}))
+    assert out["ok"] is False
+    assert "may have reached the device and moved it" in out["message"]
+    assert "Check the device state first" in out["next_step"]
+    assert "Send the command again only if it did not move" in out["next_step"]
+    assert calls == ["GET", "POST"]
+
+
+@pytest.mark.parametrize("status,payload", [
+    (401, body_of(**UNAUTHORIZED)),
+    (400, b'{"message": "Bad Request"}'),
+    (403, b'{"message": "Forbidden"}'),
+    (404, b'{"message": "Not Found"}'),
+])
+def test_rejected_command_reply_does_not_say_it_may_have_moved(status, payload, tmp_path):
+    transport, _calls = _post_reply(status, payload)
+    out = json.loads(command(deps(tmp_path, transport), {"device_id": "BOT1", "command": "press"}))
+    assert out["ok"] is False
+    assert "may have reached" not in out["message"]
+
+
+def test_status_read_502_does_not_say_it_may_have_moved(tmp_path):
+    router = Router()
+    router.add("/BOT1/status", 502, {"message": "Bad Gateway"})
+    router.add("/v1.1/devices", 200, _list([{"deviceId": "BOT1", "deviceType": "Bot"}]))
+    out = json.loads(devices(deps(tmp_path, router), {"device_id": "BOT1"}))
+    assert out["ok"] is False
+    assert "may have" not in out["message"]
+
+
+def test_watch_failure_streak_notifies_again_after_24_hours(tmp_path):
+    clock = [1_800_000_000.0]
+    router = Router()
+    router.add("/v1.1/devices", 401, UNAUTHORIZED)
+    plugin = deps(tmp_path, router, now=lambda: clock[0])
+    assert json.loads(watch(plugin, {}))["notify"] is True
+    clock[0] += 23 * 3600
+    assert json.loads(watch(plugin, {}))["notify"] is False
+    clock[0] += 3600
+    assert json.loads(watch(plugin, {}))["notify"] is True
+    clock[0] += 600
+    assert json.loads(watch(plugin, {}))["notify"] is False
+    clock[0] += 24 * 3600
+    assert json.loads(watch(plugin, {}))["notify"] is True
+
+
+def test_watch_failure_with_a_future_notice_time_notifies(tmp_path):
+    clock = [1_800_000_000.0]
+    router = Router()
+    router.add("/v1.1/devices", 401, UNAUTHORIZED)
+    (tmp_path / "watch_fail.json").write_text(
+        json.dumps({"streak": 3, "empty": 0, "notified_at": clock[0] + 7 * 86400}), encoding="utf-8",
+    )
+    plugin = deps(tmp_path, router, now=lambda: clock[0])
+    assert json.loads(watch(plugin, {}))["notify"] is True
+    assert json.loads(watch(plugin, {}))["notify"] is False

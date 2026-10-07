@@ -67,21 +67,25 @@ config_schema:
     type: string
     default: ""
     label: High temperature
-    description: Celsius. Empty means no high-temperature alert. A value that is not a number stops the watch before any API call.
+    description: >-
+      Celsius. Empty means no high-temperature alert. A value that is not a
+      number stops the device list, commands, the watch, and schedule before
+      any API call. Unschedule still works.
   temperature_low_c:
     type: string
     default: ""
     label: Low temperature
-    description: Celsius. Empty means no low-temperature alert.
+    description: Celsius. Empty means no low-temperature alert. A value that is not a number stops the tools the same way.
   humidity_high_pct:
     type: string
     default: ""
     label: High humidity
-    description: Percent. Empty means no humidity alert.
+    description: Percent. Empty means no humidity alert. A value that is not a number stops the tools the same way.
   plug_weight_watts:
     type: string
     default: ""
     label: Plug daily watts
     description: >-
       Empty means no alert on the plug "weight" field. The OpenAPI describes
-      that field as power consumed in a day, in watts.
+      that field as power consumed in a day, in watts. A value that is not a
+      number stops the tools the same way.
