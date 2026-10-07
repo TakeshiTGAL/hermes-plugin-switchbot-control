@@ -882,3 +882,214 @@ def test_watch_failure_with_a_future_notice_time_notifies(tmp_path):
     plugin = deps(tmp_path, router, now=lambda: clock[0])
     assert json.loads(watch(plugin, {}))["notify"] is True
     assert json.loads(watch(plugin, {}))["notify"] is False
+
+
+@pytest.mark.parametrize("target", ["cli", "cron", "api_server", "telegarm", "bot-chat:"])
+def test_unknown_deliver_targets_are_refused(tmp_path, target):
+    class Jobs:
+        def list_jobs(self, include_disabled=True):
+            return []
+
+        def create_job(self, **kwargs):
+            raise AssertionError(kwargs)
+
+    out = json.loads(schedule(deps(tmp_path, cron_module=Jobs()), "*/5 * * * *", target))
+    assert out["ok"] is False and out["error"] == "bad_deliver"
+
+
+def test_bot_chat_deliver_says_it_starts_a_model_turn(tmp_path):
+    made = {}
+
+    class Jobs:
+        def list_jobs(self, include_disabled=True):
+            return []
+
+        def create_job(self, **kwargs):
+            made["deliver"] = kwargs["deliver"]
+            return {"id": "job1", "schedule_display": kwargs["schedule"]}
+
+    out = json.loads(schedule(deps(tmp_path, cron_module=Jobs()), "*/5 * * * *", "bot-chat"))
+    assert out["ok"] is True and made["deliver"] == "bot-chat"
+    assert "one model turn" in out["message"] and "agent can act" in out["message"]
+    both = json.loads(schedule(deps(tmp_path, cron_module=Jobs()), "*/5 * * * *", "origin,all"))
+    assert both["ok"] is True and both["deliver"] == "origin,all"
+
+
+def _contact_routes(open_state: str):
+    return [
+        ("/CONTACT1/status", 200, body_of(
+            statusCode=100, message="success",
+            body={"deviceId": "CONTACT1", "deviceType": "Contact Sensor", "openState": open_state},
+        )),
+        ("/v1.1/devices", 200, body_of(
+            statusCode=100, message="success",
+            body={"deviceList": [{"deviceId": "CONTACT1", "deviceType": "Contact Sensor"}], "infraredRemoteList": []},
+        )),
+    ]
+
+
+def _load_switchbot(tmp_path, router, monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("SWITCHBOT_TOKEN", TOKEN)
+    monkeypatch.setenv("SWITCHBOT_SECRET", SECRET)
+    spec = importlib.util.spec_from_file_location(
+        "switchbot_fix3_plugin", root / "__init__.py", submodule_search_locations=[str(root)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    module.__path__ = [str(root)]
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    class Ctx:
+        def __init__(self):
+            self.tools = {}
+            self.command = None
+            self.cli = None
+
+        def register_tool(self, name, toolset, schema, handler, **kwargs):
+            self.tools[name] = handler
+
+        def register_command(self, name, handler, description=""):
+            self.command = handler
+
+        def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
+            self.cli = handler_fn
+
+        def get_config(self, key, default=None):
+            return default
+
+    ctx = Ctx()
+    module.register(ctx)
+    service_mod = sys.modules[spec.name + ".service"]
+    client_mod = sys.modules[spec.name + ".client"]
+    monkeypatch.setattr(service_mod, "plugin_data_dir", lambda: tmp_path)
+    if router is not None:
+        def client(deps):
+            return client_mod.SwitchBot(deps.token, deps.secret, router, deps.now)
+
+        monkeypatch.setattr(service_mod, "_client", client)
+    return ctx, service_mod, client_mod
+
+
+def _capture_cli(handler, args) -> str:
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        handler(args)
+    return buf.getvalue()
+
+
+def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
+    import asyncio
+
+    router = Router()
+    router.routes = _contact_routes("close")
+    ctx, service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch)
+    cron_on = {"value": True}
+    monkeypatch.setattr(service_mod, "_is_cron_turn", lambda: cron_on["value"])
+
+    def baseline():
+        router.routes = _contact_routes("close")
+        cron_on["value"] = True
+        first = json.loads(ctx.tools["switchbot_watch"]({}))
+        assert first["ok"] is True and "changed" not in first["message"]
+        assert (tmp_path / "watch.json").is_file()
+
+    def manual_then_cron(manual):
+        router.routes = _contact_routes("open")
+        before = (tmp_path / "watch.json").read_text(encoding="utf-8")
+        cron_on["value"] = False
+        seen = json.loads(manual())
+        assert "openState changed from close to open" in seen["message"]
+        assert (tmp_path / "watch.json").read_text(encoding="utf-8") == before
+        cron_on["value"] = True
+        again = json.loads(ctx.tools["switchbot_watch"]({}))
+        assert "openState changed from close to open" in again["message"]
+
+    baseline()
+    manual_then_cron(lambda: asyncio.run(ctx.command("watch")))
+    (tmp_path / "watch.json").unlink()
+    baseline()
+
+    class Args:
+        switchbot_command = "watch"
+
+    manual_then_cron(lambda: _capture_cli(ctx.cli, Args()))
+    (tmp_path / "watch.json").unlink()
+    baseline()
+    manual_then_cron(lambda: ctx.tools["switchbot_watch"]({}))
+
+
+def test_manual_failure_does_not_silence_the_next_cron(tmp_path, monkeypatch):
+    import asyncio
+
+    router = Router()
+    router.add("/v1.1/devices", 200, LIST_EMPTY)
+    ctx, service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch)
+    cron_on = {"value": True}
+    monkeypatch.setattr(service_mod, "_is_cron_turn", lambda: cron_on["value"])
+    assert json.loads(ctx.tools["switchbot_watch"]({}))["ok"] is True
+    router.routes.clear()
+    router.add("/v1.1/devices", 401, UNAUTHORIZED)
+    for manual in (
+        lambda: asyncio.run(ctx.command("watch")),
+        lambda: _capture_cli(ctx.cli, type("A", (), {"switchbot_command": "watch"})()),
+        lambda: ctx.tools["switchbot_watch"]({}),
+    ):
+        fail_path = tmp_path / "watch_fail.json"
+        if fail_path.exists():
+            fail_path.unlink()
+        cron_on["value"] = False
+        seen = json.loads(manual())
+        assert seen["notify"] is True
+        assert not fail_path.exists()
+        cron_on["value"] = True
+        cron = json.loads(ctx.tools["switchbot_watch"]({}))
+        assert cron["notify"] is True
+        assert fail_path.exists()
+
+
+def test_v0214_dispatch_awaits_a_slow_slash_without_blocking_the_loop(tmp_path, monkeypatch):
+    import asyncio
+    import time
+    from pathlib import Path
+
+    started = {"value": False}
+
+    class Slow(Router):
+        def __call__(self, method, url, headers, body, timeout, read_limit):
+            started["value"] = True
+            time.sleep(0.4)
+            payload = b'{"statusCode":100,"message":"success","body":{"deviceList":[],"infraredRemoteList":[]}}'
+            return 200, {"content-type": "application/json"}, payload
+
+    ctx, _service_mod, _client_mod = _load_switchbot(tmp_path, Slow(), monkeypatch)
+    source_path = Path(__file__).resolve().parents[2] / "hermes-agent-ref-v0214" / "gateway" / "run_inbound.py"
+    if source_path.is_file():
+        source = source_path.read_text(encoding="utf-8")
+        assert "if asyncio.iscoroutine(result):" in source
+        assert "result = await result" in source
+
+    async def run():
+        flag = {"ran": False}
+
+        async def sibling():
+            await asyncio.sleep(0.05)
+            flag["ran"] = True
+
+        task = asyncio.create_task(sibling())
+        result = ctx.command("watch")
+        if asyncio.iscoroutine(result):
+            result = await result
+        await task
+        return flag["ran"], result
+
+    ran, text = asyncio.run(run())
+    assert ran is True and started["value"] is True
+    assert "Read" in text or "empty" in text or "could not" in text

@@ -1,5 +1,7 @@
 """SwitchBot OpenAPI tools for Hermes. This does not use Home Assistant or BLE."""
 
+import asyncio
+
 
 def register(ctx) -> None:
     if __package__:
@@ -42,7 +44,11 @@ def register(ctx) -> None:
         return command(_deps(), args or {})
 
     def _watch(args, **_kwargs):
-        return watch(_deps(), args or {})
+        if __package__:
+            from . import service as svc
+        else:
+            import service as svc
+        return watch(_deps(), args or {}, advance=svc._is_cron_turn())
 
     ctx.register_tool(
         name="switchbot_devices",
@@ -108,7 +114,8 @@ def register(ctx) -> None:
                 "Read meters (including WoIOSensor), contact sensors, and plugs and compare them with the previous sample. "
                 "Reports a temperature, humidity, or plug-weight threshold only when config sets one, "
                 "and reports contact openState or the plain Plug power field only after it changes. "
-                "It does not report Plug Mini on or off. Does not send a command. Takes no arguments."
+                "It does not report Plug Mini on or off. Does not send a command. Takes no arguments. "
+                "A chat, slash, or CLI check does not update the cron watch. Only a cron turn writes watch.json and watch_fail.json."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -116,13 +123,13 @@ def register(ctx) -> None:
         emoji="👀",
     )
 
-    def _slash(raw_args: str) -> str:
+    def _slash_sync(raw_args: str) -> str:
         parts = (raw_args or "").split()
         cmd = parts[0] if parts else "devices"
         if cmd == "devices":
             return _devices({})
         if cmd == "watch":
-            return _watch({})
+            return watch(_deps(), {}, advance=False)
         if cmd == "schedule":
             when, deliver = slash_schedule_args(parts)
             return schedule(_deps(), when, deliver)
@@ -134,6 +141,9 @@ def register(ctx) -> None:
             "Put the delivery target first, as in schedule telegram every 10m. "
             "Commands stay on the switchbot_command tool, which asks for approval."
         )
+
+    async def _slash(raw_args: str) -> str:
+        return await asyncio.to_thread(_slash_sync, raw_args)
 
     ctx.register_command(
         "switchbot-control",
@@ -160,7 +170,7 @@ def register(ctx) -> None:
         cmd = getattr(args, "switchbot_command", None) or "devices"
         deps = _deps()
         if cmd == "watch":
-            print(watch(deps, {}))
+            print(watch(deps, {}, advance=False))
         elif cmd == "schedule":
             print(schedule(deps, args.schedule, args.deliver))
         elif cmd == "unschedule":

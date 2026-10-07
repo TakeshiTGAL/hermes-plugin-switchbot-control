@@ -517,7 +517,7 @@ def _write_watch_counts(deps: Deps, streak: int, empty: int, notified_at: float 
         return
 
 
-def _notify_watch_failure(deps: Deps, payload: str) -> str:
+def _notify_watch_failure(deps: Deps, payload: str, *, advance: bool = True) -> str:
     try:
         body = json.loads(payload)
     except json.JSONDecodeError:
@@ -532,19 +532,39 @@ def _notify_watch_failure(deps: Deps, payload: str) -> str:
         last = None
     # A streak stays quiet for 24 hours after its last notice, then notifies again.
     # A missing time, or one in the future, notifies now.
+    if not advance:
+        body["notify"] = True
+        text = str(body.get("message") or "")
+        body["message"] = (
+            text
+            + " This check did not update the cron failure record, so the owner's next cron run can still report it."
+        )
+        return _public(deps, body)
     notify = streak == 0 or last is None or not 0 <= now - last < FAILURE_REMIND_SECONDS
     body["notify"] = notify
     _write_watch_counts(deps, streak + 1, 0, now if notify else last)
     return _public(deps, body)
 
 
-def watch(deps: Deps, args: dict) -> str:
+def _is_cron_turn() -> bool:
+    """True only when Hermes says this turn is cron. A missing helper does not count as cron."""
+    try:
+        from tools.approval_context import _is_cron_approval_context
+    except Exception:
+        return False
+    try:
+        return _is_cron_approval_context() is True
+    except Exception:
+        return False
+
+
+def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
     unexpected = _unexpected(args or {}, set())
     if unexpected:
         return unexpected
     bad = _configured(deps)
     if bad:
-        return _notify_watch_failure(deps, bad)
+        return _notify_watch_failure(deps, bad, advance=advance)
     try:
         listed = _call(deps, "GET", "/v1.1/devices")
         body = listed.get("body")
@@ -626,7 +646,7 @@ def watch(deps: Deps, args: dict) -> str:
             prior = None if previous_bad or not isinstance(previous.get(device_id), dict) else previous.get(device_id)
             alert_notes.extend(f"{device_id}: {note}" for note in _alerts(prior, current, deps))
             readings[device_id] = current
-        if path is not None:
+        if path is not None and advance:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 stored = {} if previous_bad else dict(previous)
@@ -646,7 +666,7 @@ def watch(deps: Deps, args: dict) -> str:
                 alert_notes.append("The readings could not be written to watch.json.")
         warning = _near_cap(deps)
     except ApiError as exc:
-        return _notify_watch_failure(deps, _shown(deps, fail(exc.code, exc.message, exc.next_step)))
+        return _notify_watch_failure(deps, _shown(deps, fail(exc.code, exc.message, exc.next_step)), advance=advance)
     if not chosen and previous and not previous_bad:
         gap_note = (
             f"The device list has no meter, contact sensor, or plug. "
@@ -662,7 +682,8 @@ def watch(deps: Deps, args: dict) -> str:
     if not chosen and not notes:
         _streak, empty_count = _read_watch_counts(deps)
         empty_notice = empty_count == 0
-        _write_watch_counts(deps, 0, empty_count + 1)
+        if advance:
+            _write_watch_counts(deps, 0, empty_count + 1)
         if empty_notice:
             message = (
                 "No meter, contact sensor, or plug was in the device list. "
@@ -678,12 +699,15 @@ def watch(deps: Deps, args: dict) -> str:
                 "A quiet tick is not a healthy watch."
             )
     elif notes:
-        _write_watch_counts(deps, 0, 0)
+        if advance:
+            _write_watch_counts(deps, 0, 0)
         message = " ".join(notes)
     else:
-        _write_watch_counts(deps, 0, 0)
+        if advance:
+            _write_watch_counts(deps, 0, 0)
+        verb = "Stored" if advance else "Read"
         message = (
-            f"Stored {len(readings)} readings. No meter threshold, contact openState change, "
+            f"{verb} {len(readings)} readings. No meter threshold, contact openState change, "
             "or plain Plug on/off string change. A numeric power field is not compared. "
             "Plug Mini on/off is not watched."
         )
@@ -691,6 +715,8 @@ def watch(deps: Deps, args: dict) -> str:
         message += f" {skipped} matching devices were not read because max_status_reads is {deps.max_status_reads}."
     if warning:
         message = warning + " " + message
+    if not advance and (alert_notes or empty_notice):
+        message += " This check did not update the cron watch, so the owner's next cron run can still report it."
     return _public(deps, {
         "ok": True,
         "moved": False,
@@ -721,6 +747,56 @@ def slash_schedule_args(parts: list[str], default: str = DEFAULT_SCHEDULE) -> tu
     return when, deliver
 
 
+_DELIVER_PLATFORMS = frozenset({
+    "telegram", "discord", "slack", "whatsapp", "signal",
+    "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
+    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
+    "qqbot", "yuanbao",
+})
+_DELIVER_SPECIAL = frozenset({"local", "origin", "all"})
+
+
+def _extra_platform_names() -> set[str]:
+    try:
+        from gateway.platform_registry import platform_registry
+    except Exception:
+        return set()
+    try:
+        return {str(name).strip().lower() for name in platform_registry.registered_names() if str(name).strip()}
+    except Exception:
+        return set()
+
+
+def canonical_deliver(value: str) -> str | None:
+    """Return a deliver string Hermes cron can route, or None when a part would be stored and then dropped."""
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        return None
+    known = _DELIVER_PLATFORMS | _extra_platform_names()
+    kept: list[str] = []
+    for part in parts:
+        low = part.lower()
+        if low in _DELIVER_SPECIAL or low in known:
+            kept.append(low)
+            continue
+        if low == "bot-chat":
+            kept.append("bot-chat")
+            continue
+        if low.startswith("bot-chat:"):
+            name = part.split(":", 1)[1].strip()
+            if not name:
+                return None
+            kept.append("bot-chat:" + name)
+            continue
+        if ":" in part:
+            platform, rest = part.split(":", 1)
+            if platform.strip().lower() in known and rest.strip():
+                kept.append(platform.strip().lower() + ":" + rest.strip())
+                continue
+        return None
+    return ",".join(kept)
+
+
 def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str:
     bad = _configured(deps)
     if bad:
@@ -739,6 +815,15 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "or /switchbot-control schedule local */5 * * * *. "
             "From the CLI: hermes switchbot-control schedule --deliver telegram --schedule \"every 10m\".",
         )
+    accepted = canonical_deliver(deliver)
+    if accepted is None:
+        return fail(
+            "bad_deliver",
+            f"The delivery target {deliver.strip()!r} is not a Hermes cron destination, so no cron job was created.",
+            "Use local, origin, all, a platform name such as telegram, platform:chat_id, bot-chat, "
+            "or a comma combination such as origin,all. cli, cron, and api_server are not delivery targets.",
+        )
+    deliver = accepted
     floor = min_gap_seconds(deps.max_status_reads, deps.daily_cap)
     refusal = schedule_refusal(when, floor)
     if refusal:
@@ -788,6 +873,10 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "If a run is still going, Hermes skips the next slot, so a slow watch is not 288 turns. "
             "Hermes skips the agent with no_agent=True, which requires a script, when a script returns wakeAgent=false, or when monitor_script or monitor_url output is unchanged. This plugin passes none of those. "
             "Removing this plugin does not remove the job."
+            + (
+                " bot-chat delivery starts one model turn, and the agent can act on that text."
+                if "bot-chat" in target.lower() else ""
+            )
         ),
         "job_id": created.get("id"),
         "deliver": target,
