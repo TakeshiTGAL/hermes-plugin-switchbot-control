@@ -1,6 +1,7 @@
 """SwitchBot OpenAPI tools for Hermes. This does not use Home Assistant or BLE."""
 
 import asyncio
+import os
 
 
 def register(ctx) -> None:
@@ -48,7 +49,20 @@ def register(ctx) -> None:
             from . import service as svc
         else:
             import service as svc
-        return watch(_deps(), args or {}, advance=svc._is_cron_turn())
+        if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+            return watch(_deps(), args or {}, advance=False)
+        mark = svc.cron_mark()
+        if mark == "unknown":
+            return svc.fail(
+                "cron_mark",
+                "This process cannot see Hermes's cron mark. "
+                "This check cannot watch devices in this shape. "
+                "This check did not report the devices as unchanged and did not update the cron watch.",
+                "The cron watch needs Hermes to say whether this turn is cron. "
+                "A slash or CLI watch can still read without updating the cron files.",
+                notify=True,
+            )
+        return watch(_deps(), args or {}, advance=mark == "cron")
 
     ctx.register_tool(
         name="switchbot_devices",

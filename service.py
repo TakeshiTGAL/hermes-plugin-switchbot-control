@@ -611,22 +611,29 @@ def _notify_watch_failure(deps: Deps, payload: str, *, advance: bool = True) -> 
     return _public(deps, body)
 
 
-def _is_cron_turn() -> bool:
-    """True only when Hermes says this turn is cron. A missing helper does not count as cron."""
+def cron_mark() -> str:
+    """``cron`` when Hermes says so, ``manual`` when it says not, ``unknown`` when the helper is missing or raises."""
     try:
         from tools.approval_context import _is_cron_approval_context
     except Exception:
-        return False
+        return "unknown"
     try:
-        return _is_cron_approval_context() is True
+        return "cron" if _is_cron_approval_context() is True else "manual"
     except Exception:
-        return False
+        return "unknown"
+
+
+def _is_cron_turn() -> bool:
+    """True only when Hermes says this turn is cron."""
+    return cron_mark() == "cron"
 
 
 def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
     unexpected = _unexpected(args or {}, set())
     if unexpected:
-        return unexpected
+        body = json.loads(unexpected)
+        body["notify"] = False
+        return dumps(body)
     if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
         return fail(
             "plugin_host",
@@ -646,6 +653,7 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
             return _notify_watch_failure(
                 deps,
                 fail("bad_list", "The list response did not contain deviceList.", "No status call was made."),
+                advance=advance,
             )
         chosen = []
         for item in body["deviceList"]:
@@ -683,10 +691,16 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
         quiet_notes: list[str] = []
         numeric_power_changed = False
         if previous_bad:
-            alert_notes.append(
-                "watch.json could not be read, so this tick does not say that nothing changed. "
-                "New readings are stored as the baseline."
-            )
+            if advance:
+                alert_notes.append(
+                    "watch.json could not be read, so this tick does not say that nothing changed. "
+                    "New readings are stored as the baseline."
+                )
+            else:
+                alert_notes.append(
+                    "watch.json could not be read, so this check does not say that nothing changed. "
+                    "This check did not update the cron watch."
+                )
         for device_id, device_type in chosen:
             remaining = deps.daily_cap - _read_usage(deps)["count"]
             if remaining < 1:

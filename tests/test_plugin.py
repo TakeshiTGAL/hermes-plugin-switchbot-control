@@ -340,6 +340,38 @@ def test_outdoor_meter_is_not_reported_as_absent(tmp_path):
     assert any("/WO1/status" in call["url"] for call in router.calls)
 
 
+def test_manual_bad_list_does_not_consume_the_next_cron_failure(tmp_path):
+    router = Router()
+    router.add("/v1.1/devices", 200, {"statusCode": 100, "message": "success", "body": {}})
+    plugin = deps(tmp_path, router)
+    manual = json.loads(watch(plugin, {}, advance=False))
+    assert manual["ok"] is False
+    assert manual["error"] == "bad_list"
+    assert "did not update the cron failure record" in manual["message"]
+    assert not (tmp_path / "watch_fail.json").exists()
+    router.routes.clear()
+    router.add("/v1.1/devices", 401, UNAUTHORIZED)
+    cron = json.loads(watch(plugin, {}))
+    assert cron["notify"] is True
+    assert cron["ok"] is False
+
+
+def test_manual_unreadable_watch_does_not_claim_a_stored_baseline(tmp_path):
+    (tmp_path / "watch.json").write_text("{", encoding="utf-8")
+    router = Router()
+    router.add("/CONTACT1/status", 200, {
+        "statusCode": 100,
+        "message": "success",
+        "body": {"deviceId": "CONTACT1", "deviceType": "Contact Sensor", "openState": "close"},
+    })
+    router.add("/v1.1/devices", 200, _list([{"deviceId": "CONTACT1", "deviceType": "Contact Sensor"}]))
+    out = json.loads(watch(deps(tmp_path, router), {}, advance=False))
+    assert "could not be read" in out["message"]
+    assert "stored as the baseline" not in out["message"]
+    assert "did not update the cron watch" in out["message"]
+    assert (tmp_path / "watch.json").read_text(encoding="utf-8") == "{"
+
+
 def test_unreadable_watch_file_is_not_called_no_change(tmp_path):
     (tmp_path / "watch.json").write_text("{", encoding="utf-8")
     router = Router()
@@ -725,7 +757,7 @@ def test_watch_bad_arguments_do_not_start_a_failure_streak(tmp_path):
     wrong = json.loads(watch(plugin, {"device_id": "X"}))
     assert wrong["ok"] is False
     assert wrong["error"] == "bad_args"
-    assert wrong.get("notify") is not True
+    assert wrong["notify"] is False
     assert not (tmp_path / "watch_fail.json").exists()
     assert router.calls == []
     first_real = json.loads(watch(plugin, {}))
@@ -1006,6 +1038,22 @@ def test_plugin_host_watch_does_not_report_devices_unchanged(tmp_path, monkeypat
     assert router.calls == []
 
 
+def test_tool_watch_without_a_cron_mark_does_not_report_unchanged(tmp_path, monkeypatch):
+    router = Router()
+    router.add("/v1.1/devices", 200, LIST_EMPTY)
+    ctx, service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch)
+    monkeypatch.setattr(service_mod, "cron_mark", lambda: "unknown")
+    body = json.loads(ctx.tools["switchbot_watch"]({}))
+    assert body["ok"] is False
+    assert body["error"] == "cron_mark"
+    assert body["notify"] is True
+    assert "cannot watch" in body["message"]
+    assert "unchanged" in body["message"]
+    assert router.calls == []
+    assert not (tmp_path / "watch.json").exists()
+    assert not (tmp_path / "watch_fail.json").exists()
+
+
 def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
     import asyncio
 
@@ -1013,7 +1061,7 @@ def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
     router.routes = _contact_routes("close")
     ctx, service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch)
     cron_on = {"value": True}
-    monkeypatch.setattr(service_mod, "_is_cron_turn", lambda: cron_on["value"])
+    monkeypatch.setattr(service_mod, "cron_mark", lambda: "cron" if cron_on["value"] else "manual")
 
     def baseline():
         router.routes = _contact_routes("close")
@@ -1054,7 +1102,7 @@ def test_manual_failure_does_not_silence_the_next_cron(tmp_path, monkeypatch):
     router.add("/v1.1/devices", 200, LIST_EMPTY)
     ctx, service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch)
     cron_on = {"value": True}
-    monkeypatch.setattr(service_mod, "_is_cron_turn", lambda: cron_on["value"])
+    monkeypatch.setattr(service_mod, "cron_mark", lambda: "cron" if cron_on["value"] else "manual")
     assert json.loads(ctx.tools["switchbot_watch"]({}))["ok"] is True
     router.routes.clear()
     router.add("/v1.1/devices", 401, UNAUTHORIZED)
