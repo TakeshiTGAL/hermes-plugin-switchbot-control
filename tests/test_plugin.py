@@ -575,6 +575,7 @@ def test_empty_list_notifies_once_and_an_offline_device_keeps_the_rest(tmp_path)
     saved = json.loads((tmp_path / "watch.json").read_text(encoding="utf-8"))
     assert "METER1" in saved["devices"]
     assert "OFF1" not in saved["devices"]
+    assert not (tmp_path / "watch.json.tmp").exists()
     router.routes.clear()
     router.add("/v1.1/devices", 200, LIST_EMPTY)
     again = json.loads(watch(plugin, {}))
@@ -586,8 +587,9 @@ def test_empty_list_notifies_once_and_an_offline_device_keeps_the_rest(tmp_path)
     router.routes.clear()
     router.add("/v1.1/devices", 200, LIST_EMPTY)
     after_failure = json.loads(watch(plugin, {}))
-    assert after_failure["notify"] is False
+    assert after_failure["notify"] is True
     assert "previous watch file" in after_failure["message"]
+    assert "has cleared" in after_failure["message"]
 
 
 def test_one_status_failure_does_not_hide_another_door(tmp_path):
@@ -652,6 +654,10 @@ def test_watch_failure_notifies_only_the_first_of_a_streak(tmp_path):
     router.add("/v1.1/devices", 200, LIST_EMPTY)
     ok = json.loads(watch(plugin, {}))
     assert ok["ok"] is True
+    assert ok["notify"] is True
+    assert "has cleared" in ok["message"]
+    quiet = json.loads(watch(plugin, {}))
+    assert quiet["notify"] is False
     router.routes.clear()
     router.add("/v1.1/devices", 401, UNAUTHORIZED)
     again = json.loads(watch(plugin, {}))

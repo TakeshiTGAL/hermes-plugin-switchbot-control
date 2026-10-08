@@ -747,7 +747,9 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
                 payload = {"devices": stored, "faults": faults}
                 if not chosen and previous and not previous_bad:
                     payload["list_gap"] = True
-                path.write_text(json.dumps(payload), encoding="utf-8")
+                tmp = path.with_name("watch.json.tmp")
+                tmp.write_text(json.dumps(payload), encoding="utf-8")
+                os.replace(tmp, path)
             except OSError:
                 alert_notes.append("The readings could not be written to watch.json.")
         warning = _near_cap(deps)
@@ -764,6 +766,8 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
         else:
             alert_notes.append(gap_note)
     notes = alert_notes + quiet_notes
+    streak_before = _read_watch_counts(deps)[0] if advance else 0
+    recovered = bool(advance and streak_before > 0)
     empty_notice = False
     if not chosen and not notes:
         _streak, empty_count = _read_watch_counts(deps)
@@ -806,6 +810,8 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
             )
     if skipped:
         message += f" {skipped} matching devices were not read because max_status_reads is {deps.max_status_reads}."
+    if recovered:
+        message += " The previous watch failure has cleared. This tick succeeded."
     if warning:
         message = warning + " " + message
     if not advance and (alert_notes or empty_notice):
@@ -813,7 +819,7 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
     return _public(deps, {
         "ok": True,
         "moved": False,
-        "notify": bool(alert_notes or warning or empty_notice),
+        "notify": bool(alert_notes or warning or empty_notice or recovered),
         "message": message,
         "readings": len(readings),
         "calls_today": _read_usage(deps)["count"],
