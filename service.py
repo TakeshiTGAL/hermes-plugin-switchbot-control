@@ -63,7 +63,12 @@ _PROFILE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345
 
 
 def _profile_name() -> str:
-    """Active Hermes profile. ``default`` when unset or ``~/.hermes``."""
+    """Active Hermes profile.
+
+    ``default`` when unset or ``~/.hermes``. A home shaped as ``<root>/profiles/<name>``
+    uses that directory name even when the root is not ``~/.hermes`` (``hermes -p``
+    only rewrites ``HERMES_HOME``). Any other home is ``custom``.
+    """
     for key in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
         value = os.environ.get(key, "").strip()
         if value and set(value) <= _PROFILE_CHARS:
@@ -78,7 +83,7 @@ def _profile_name() -> str:
         return "default"
     if path == default_home:
         return "default"
-    if path.parent.name == "profiles" and path.parent.parent == default_home and set(path.name) <= _PROFILE_CHARS:
+    if path.parent.name == "profiles" and set(path.name) <= _PROFILE_CHARS and not path.name.startswith("."):
         return path.name
     return "custom"
 
@@ -626,8 +631,10 @@ def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
         return fail(
             "plugin_host",
             "plugins.isolation is host, so this process cannot see Hermes's cron mark. "
+            "This check cannot watch devices in this shape. "
             "This check did not report the devices as unchanged and did not update the cron watch.",
             "Set plugins.isolation to in_process. The cron watch does not run in the plugin host.",
+            notify=True,
         )
     bad = _configured(deps)
     if bad:

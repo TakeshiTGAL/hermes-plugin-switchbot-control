@@ -992,6 +992,8 @@ def test_plugin_host_watch_does_not_report_devices_unchanged(tmp_path, monkeypat
     body = json.loads(ctx.tools["switchbot_watch"]({}))
     assert body["ok"] is False
     assert body["error"] == "plugin_host"
+    assert body["notify"] is True
+    assert "cannot watch" in body["message"]
     assert "unchanged" in body["message"]
     assert "cron mark" in body["message"]
     assert not (tmp_path / "watch.json").exists()

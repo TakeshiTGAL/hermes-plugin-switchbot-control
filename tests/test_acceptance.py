@@ -725,6 +725,18 @@ def test_row21_cli_flags_and_profile_prefix(tmp_path, monkeypatch):
     plain = json.loads(schedule(deps(tmp_path, cron_module=Jobs()), "every 10m", "local"))
     assert "hermes cron list" in plain["message"]
     assert "hermes -p " not in plain["message"]
+    profile_home = tmp_path / "hermes-root" / "profiles" / "harnessprof"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    from_home = json.loads(schedule(deps(tmp_path, cron_module=Jobs()), "every 10m", "local"))
+    assert "hermes -p harnessprof cron list" in from_home["message"]
+    assert "hermes -p harnessprof cron status" in from_home["message"]
+    assert "hermes -p harnessprof cron remove" in from_home["message"]
+    other = tmp_path / "not-a-profile"
+    other.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(other))
+    custom = json.loads(schedule(deps(tmp_path, cron_module=Jobs()), "every 10m", "local"))
+    assert "hermes -p custom cron list" in custom["message"]
 
 
 def test_row22_and_23_schedule_words_and_the_speed_floor(tmp_path):
