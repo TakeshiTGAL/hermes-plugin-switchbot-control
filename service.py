@@ -864,6 +864,9 @@ def slash_schedule_args(parts: list[str], default: str = DEFAULT_SCHEDULE) -> tu
     return when, deliver
 
 
+# v0.21.4's built-in deliver names, including homeassistant. Used only when
+# cron.scheduler_delivery cannot be imported. A running Hermes replaces this
+# with its own _KNOWN_DELIVERY_PLATFORMS, so a name that tree dropped is refused.
 _DELIVER_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
@@ -873,15 +876,40 @@ _DELIVER_PLATFORMS = frozenset({
 _DELIVER_SPECIAL = frozenset({"local", "origin", "all"})
 
 
-def _extra_platform_names() -> set[str]:
+def _builtin_deliver_platforms() -> set[str]:
+    """Names the running Hermes cron delivers. The frozen set is the offline fallback."""
+    try:
+        from cron.scheduler_delivery import _KNOWN_DELIVERY_PLATFORMS
+    except Exception:
+        return set(_DELIVER_PLATFORMS)
+    try:
+        return {str(name).strip().lower() for name in _KNOWN_DELIVERY_PLATFORMS if str(name).strip()}
+    except Exception:
+        return set(_DELIVER_PLATFORMS)
+
+
+def _plugin_deliver_names() -> set[str]:
+    """Loaded platforms Hermes will deliver. A registry name without cron_deliver_env_var is not delivered."""
     try:
         from gateway.platform_registry import platform_registry
     except Exception:
         return set()
     try:
-        return {str(name).strip().lower() for name in platform_registry.registered_names() if str(name).strip()}
+        names = platform_registry.registered_names()
     except Exception:
         return set()
+    found: set[str] = set()
+    for name in names:
+        text = str(name).strip().lower()
+        if not text:
+            continue
+        try:
+            entry = platform_registry.get(text)
+        except Exception:
+            continue
+        if entry is not None and getattr(entry, "cron_deliver_env_var", None):
+            found.add(text)
+    return found
 
 
 def canonical_deliver(value: str) -> str | None:
@@ -889,7 +917,7 @@ def canonical_deliver(value: str) -> str | None:
     parts = [part.strip() for part in value.split(",")]
     if not parts or any(not part for part in parts):
         return None
-    known = _DELIVER_PLATFORMS | _extra_platform_names()
+    known = _builtin_deliver_platforms() | _plugin_deliver_names()
     kept: list[str] = []
     for part in parts:
         low = part.lower()

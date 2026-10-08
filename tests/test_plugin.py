@@ -922,6 +922,108 @@ def test_watch_failure_with_a_future_notice_time_notifies(tmp_path):
     assert json.loads(watch(plugin, {}))["notify"] is False
 
 
+class _RecordingJobs:
+    def __init__(self):
+        self.created = []
+
+    def list_jobs(self, include_disabled=True):
+        return []
+
+    def create_job(self, **kwargs):
+        self.created.append(kwargs)
+        return {"id": "job1", "schedule_display": kwargs["schedule"]}
+
+
+def _install_live_deliver_set(monkeypatch, names):
+    import sys
+    import types
+
+    cron_pkg = types.ModuleType("cron")
+    cron_pkg.__path__ = []
+    delivery = types.ModuleType("cron.scheduler_delivery")
+    delivery._KNOWN_DELIVERY_PLATFORMS = frozenset(names)
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler_delivery", delivery)
+
+
+def _install_plugin_registry(monkeypatch, entries):
+    import sys
+    import types
+
+    gateway_pkg = types.ModuleType("gateway")
+    gateway_pkg.__path__ = []
+    registry_mod = types.ModuleType("gateway.platform_registry")
+
+    class Registry:
+        def registered_names(self):
+            return list(entries)
+
+        def get(self, name):
+            env = entries.get(name)
+            if env is None and name not in entries:
+                return None
+
+            class Entry:
+                cron_deliver_env_var = env
+
+            return Entry()
+
+    registry_mod.platform_registry = Registry()
+    monkeypatch.setitem(sys.modules, "gateway", gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.platform_registry", registry_mod)
+
+
+def test_schedule_refuses_homeassistant_when_the_running_hermes_does_not_deliver_it(tmp_path, monkeypatch):
+    _install_live_deliver_set(monkeypatch, {"telegram", "discord"})
+    _install_plugin_registry(monkeypatch, {"homeassistant": ""})
+    jobs = _RecordingJobs()
+    out = json.loads(schedule(deps(tmp_path, cron_module=jobs), "*/5 * * * *", "homeassistant"))
+    assert out["ok"] is False and out["error"] == "bad_deliver"
+    assert jobs.created == []
+    chat = json.loads(schedule(deps(tmp_path, cron_module=jobs), "*/5 * * * *", "homeassistant:mobile_app"))
+    assert chat["ok"] is False and chat["error"] == "bad_deliver"
+    assert jobs.created == []
+    kept = json.loads(schedule(deps(tmp_path, cron_module=jobs), "*/5 * * * *", "telegram"))
+    assert kept["ok"] is True and kept["deliver"] == "telegram"
+    assert jobs.created[0]["deliver"] == "telegram"
+
+
+def test_schedule_accepts_homeassistant_when_the_running_hermes_lists_it(tmp_path, monkeypatch):
+    _install_live_deliver_set(monkeypatch, {"telegram", "homeassistant"})
+    jobs = _RecordingJobs()
+    out = json.loads(schedule(deps(tmp_path, cron_module=jobs), "*/5 * * * *", "homeassistant"))
+    assert out["ok"] is True and out["deliver"] == "homeassistant"
+    assert jobs.created[0]["deliver"] == "homeassistant"
+
+
+def test_schedule_accepts_a_plugin_platform_with_a_cron_env_var(tmp_path, monkeypatch):
+    _install_live_deliver_set(monkeypatch, {"telegram"})
+    _install_plugin_registry(monkeypatch, {"ntfy": "NTFY_HOME_CHANNEL"})
+    jobs = _RecordingJobs()
+    out = json.loads(schedule(deps(tmp_path, cron_module=jobs), "*/5 * * * *", "ntfy"))
+    assert out["ok"] is True and out["deliver"] == "ntfy"
+    assert jobs.created[0]["deliver"] == "ntfy"
+
+
+def test_schedule_keeps_the_floor_list_when_hermes_delivery_cannot_be_read(tmp_path, monkeypatch):
+    import builtins
+    import sys
+
+    monkeypatch.delitem(sys.modules, "cron.scheduler_delivery", raising=False)
+    real_import = builtins.__import__
+
+    def blocked(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "cron.scheduler_delivery":
+            raise ImportError("hermes delivery list is unreadable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    jobs = _RecordingJobs()
+    out = json.loads(schedule(deps(tmp_path, cron_module=jobs), "*/5 * * * *", "homeassistant"))
+    assert out["ok"] is True and out["deliver"] == "homeassistant"
+    assert jobs.created[0]["deliver"] == "homeassistant"
+
+
 @pytest.mark.parametrize("target", ["cli", "cron", "api_server", "telegarm", "bot-chat:"])
 def test_unknown_deliver_targets_are_refused(tmp_path, target):
     class Jobs:
