@@ -71,7 +71,9 @@ class _NoRedirect(urllib.request.HTTPErrorProcessor):
 
 def _urllib_transport(method: str, url: str, headers: Mapping[str, str], body: bytes | None, timeout: float, limit: int):
     req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
-    opener = urllib.request.build_opener(_NoRedirect)
+    # ProxyHandler({}) replaces urllib's default, so an environment proxy does not
+    # receive the token.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
         with opener.open(req, timeout=timeout) as resp:
             status = getattr(resp, "status", None) or resp.getcode()

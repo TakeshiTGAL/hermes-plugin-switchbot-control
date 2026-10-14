@@ -31,11 +31,12 @@ def register(ctx) -> None:
         )
 
     def _deps():
-        import os
+        from agent.secret_scope import get_secret
+
         return deps_from_config(
             ctx.get_config,
-            token=os.environ.get("SWITCHBOT_TOKEN", ""),
-            secret=os.environ.get("SWITCHBOT_SECRET", ""),
+            token=get_secret("SWITCHBOT_TOKEN") or "",
+            secret=get_secret("SWITCHBOT_SECRET") or "",
         )
 
     def _devices(args, **_kwargs):

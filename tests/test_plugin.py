@@ -1068,14 +1068,15 @@ def _contact_routes(open_state: str):
     ]
 
 
-def _load_switchbot(tmp_path, router, monkeypatch):
+def _load_switchbot(tmp_path, router, monkeypatch, *, set_env=True):
     import importlib.util
     import sys
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
-    monkeypatch.setenv("SWITCHBOT_TOKEN", TOKEN)
-    monkeypatch.setenv("SWITCHBOT_SECRET", SECRET)
+    if set_env:
+        monkeypatch.setenv("SWITCHBOT_TOKEN", TOKEN)
+        monkeypatch.setenv("SWITCHBOT_SECRET", SECRET)
     spec = importlib.util.spec_from_file_location(
         "switchbot_fix3_plugin", root / "__init__.py", submodule_search_locations=[str(root)],
     )
@@ -1126,6 +1127,7 @@ def _capture_cli(handler, args) -> str:
 
 
 def test_plugin_host_watch_does_not_report_devices_unchanged(tmp_path, monkeypatch):
+    pytest.importorskip("agent.secret_scope")
     router = Router()
     ctx, _service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch)
     monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "1")
@@ -1157,6 +1159,7 @@ def test_tool_watch_without_a_cron_mark_does_not_report_unchanged(tmp_path, monk
 
 
 def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
+    pytest.importorskip("agent.secret_scope")
     import asyncio
 
     router = Router()
@@ -1198,6 +1201,7 @@ def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
 
 
 def test_manual_failure_does_not_silence_the_next_cron(tmp_path, monkeypatch):
+    pytest.importorskip("agent.secret_scope")
     import asyncio
 
     router = Router()
@@ -1227,6 +1231,7 @@ def test_manual_failure_does_not_silence_the_next_cron(tmp_path, monkeypatch):
 
 
 def test_v0214_dispatch_awaits_a_slow_slash_without_blocking_the_loop(tmp_path, monkeypatch):
+    pytest.importorskip("agent.secret_scope")
     import asyncio
     import time
     from pathlib import Path
@@ -1264,3 +1269,135 @@ def test_v0214_dispatch_awaits_a_slow_slash_without_blocking_the_loop(tmp_path, 
     ran, text = asyncio.run(run())
     assert ran is True and started["value"] is True
     assert "Read" in text or "empty" in text or "could not" in text
+
+
+_MISSING = "SWITCHBOT_TOKEN and SWITCHBOT_SECRET are not both set."
+_ENV_READ = __import__("re").compile(
+    r"""os\s*\.\s*(?:getenv\s*\(|environ\s*\.\s*get\s*\(|environ\s*\[\s*)\s*['\"](?:SWITCHBOT_TOKEN|SWITCHBOT_SECRET)['\"]"""
+)
+
+
+def _release_scope(scope, token):
+    if token is not None:
+        try:
+            scope.reset_secret_scope(token)
+        except ValueError:
+            pass
+    scope.set_secret_scope(None)
+    scope.set_multiplex_active(False)
+
+
+def test_scope_value_is_used_when_environ_differs(tmp_path, monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("SWITCHBOT_TOKEN", "env-token")
+    monkeypatch.setenv("SWITCHBOT_SECRET", "env-secret")
+    router = Router()
+    router.add("/v1.1/devices", 200, LIST_EMPTY)
+    ctx, _service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch, set_env=False)
+    token = scope.set_secret_scope({
+        "SWITCHBOT_TOKEN": "scope-token",
+        "SWITCHBOT_SECRET": "scope-secret",
+    })
+    try:
+        body = json.loads(ctx.tools["switchbot_devices"]({}))
+    finally:
+        _release_scope(scope, token)
+    assert body["ok"] is True
+    assert router.calls[0]["headers"]["Authorization"] == "scope-token"
+    assert "env-token" not in json.dumps(router.calls)
+
+
+def test_multiplex_scope_miss_does_not_read_environ(tmp_path, monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("SWITCHBOT_TOKEN", "env-token")
+    monkeypatch.setenv("SWITCHBOT_SECRET", "env-secret")
+    ctx, _service_mod, _client_mod = _load_switchbot(tmp_path, None, monkeypatch, set_env=False)
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope({"UNRELATED": "present"})
+    try:
+        raw = ctx.tools["switchbot_devices"]({})
+    finally:
+        _release_scope(scope, token)
+    body = json.loads(raw)
+    assert body["ok"] is False and body["error"] == "missing_key"
+    assert body["message"] == _MISSING
+    assert "env-token" not in raw
+    assert "env-secret" not in raw
+
+
+def test_unscoped_multiplex_raises_and_does_not_call_upstream(tmp_path, monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("SWITCHBOT_TOKEN", "env-token")
+    monkeypatch.setenv("SWITCHBOT_SECRET", "env-secret")
+    router = Router()
+    router.add("/v1.1/devices", 200, LIST_EMPTY)
+    ctx, _service_mod, _client_mod = _load_switchbot(tmp_path, router, monkeypatch, set_env=False)
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope(None)
+    try:
+        with pytest.raises(scope.UnscopedSecretError):
+            ctx.tools["switchbot_devices"]({})
+    finally:
+        _release_scope(scope, token)
+    assert router.calls == []
+
+
+def test_unset_credentials_keep_the_fixed_error(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWITCHBOT_TOKEN", raising=False)
+    monkeypatch.delenv("SWITCHBOT_SECRET", raising=False)
+    scope = pytest.importorskip("agent.secret_scope")
+    cleared = scope.set_secret_scope(None)
+    scope.set_multiplex_active(False)
+    ctx, _service_mod, _client_mod = _load_switchbot(tmp_path, None, monkeypatch, set_env=False)
+    try:
+        body = json.loads(ctx.tools["switchbot_devices"]({}))
+    finally:
+        _release_scope(scope, cleared)
+    assert body["ok"] is False and body["error"] == "missing_key"
+    assert body["message"] == _MISSING
+
+
+def test_plugin_code_does_not_read_switchbot_from_environ():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for path in sorted(root.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        assert _ENV_READ.search(text) is None, path.name
+
+
+def test_opener_ignores_https_proxy(monkeypatch):
+    import socket
+    import urllib.request
+
+    import client
+
+    passed = []
+    real_build = urllib.request.build_opener
+
+    def spy(*handlers):
+        passed.append(handlers)
+        return real_build(*handlers)
+
+    monkeypatch.setattr(client.urllib.request, "build_opener", spy)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:8443")
+    monkeypatch.setenv("https_proxy", "http://proxy.test:8443")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.test:8443")
+    monkeypatch.setenv("http_proxy", "http://proxy.test:8443")
+    targets = []
+
+    def blocked(address, *args, **kwargs):
+        targets.append(address)
+        raise OSError("blocked")
+
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    try:
+        client._urllib_transport("GET", "https://api.switch-bot.com/v1.1/devices", {}, None, 1.0, 100)
+    except Exception:
+        pass
+    proxies = [handler for handler in passed[0] if isinstance(handler, urllib.request.ProxyHandler)]
+    assert len(proxies) == 1 and proxies[0].proxies == {}
+    assert targets
+    hosts = [item[0] if isinstance(item, tuple) else item for item in targets]
+    assert hosts[0] == "api.switch-bot.com"
+    assert "proxy.test" not in hosts
