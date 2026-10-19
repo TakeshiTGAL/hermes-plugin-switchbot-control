@@ -12,6 +12,10 @@ Authentication and error shapes were checked against the live SwitchBot API. Dev
 2. `switchbot_command` sends one command from a fixed list, after Hermes approval.
 3. `switchbot_watch` reads meters, contact sensors, and plugs. It reports the plain Plug `power` string, not Plug Mini on or off. The cron prompt tells the job to call this tool only. The toolset still contains `switchbot_command`, and a cron context cannot send a command.
 
+A skill (`switchbot-devices`) is registered while the plugin is enabled. It adds one line to the skills index of every session and tells the agent to look these tools up with `tool_search` before web search. It stays listed even on a surface where the tools were turned off with `hermes tools`; there the calls are simply unavailable.
+
+Schedule delivery: the plugin discovers Hermes platform plugins before it checks a delivery name, so a schedule can deliver to a platform such as `telegram` on Hermes main (v0.22.2 was not affected); an unknown name is refused.
+
 ## Signing
 
 The sign that the live API accepted is the Python 3 example in the [SwitchBotAPI README](https://github.com/OpenWonderLabs/SwitchBotAPI): base64 of HMAC-SHA256 over `token + timestamp + nonce`, keyed with the secret. Headers are `Authorization`, `sign`, `t`, and `nonce`. The short uppercase `token + timestamp` example in that README was not sent.

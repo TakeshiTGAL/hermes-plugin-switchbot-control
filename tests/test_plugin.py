@@ -1401,3 +1401,11 @@ def test_opener_ignores_https_proxy(monkeypatch):
     hosts = [item[0] if isinstance(item, tuple) else item for item in targets]
     assert hosts[0] == "api.switch-bot.com"
     assert "proxy.test" not in hosts
+
+
+def test_set_position_empty_gets_the_range_message():
+    from policy import prepare_command as _prep
+    for empty in (None, "", "  "):
+        message = _prep("setPosition", empty)
+        assert isinstance(message, str)
+        assert "0,ff,0 through 0,ff,100" in message

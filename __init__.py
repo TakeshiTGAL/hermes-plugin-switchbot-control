@@ -71,9 +71,10 @@ def register(ctx) -> None:
         schema={
             "name": "switchbot_devices",
             "description": (
-                "List SwitchBot devices and infrared remotes on the configured account. "
+                "SwitchBot account: list devices and their status. "
                 "Pass device_id to also read that device's status. "
-                "An empty status body is not reported as a device state. Does not send a command."
+                "An empty status body is not reported as a device state. Does not send a command. "
+                "List the home devices. A meter is the room temperature sensor."
             ),
             "parameters": {
                 "type": "object",
@@ -91,13 +92,15 @@ def register(ctx) -> None:
         schema={
             "name": "switchbot_command",
             "description": (
+                "SwitchBot: send one command to a named device. "
                 "Send one whitelisted SwitchBot command. Each call asks Hermes for approval with a new rule, so a previous always or session choice does not cover the next call. "
                 "lock, unlock, and deadbolt, and lock, keypad, garage, or door device types, "
                 "are refused unless safety_devices is enabled, and still ask for approval. "
                 "Does nothing from cron, yolo, approvals off, a single-query session, an unattended session, "
                 "or when an approval helper is missing, renamed, or raises. "
                 "The API accepted the command only when the response is HTTP 200, statusCode 100, and message success. "
-                "That does not mean the device was observed to move."
+                "That does not mean the device was observed to move. "
+                "Control a smart home device: turn a light or a plug on or off, turn an air conditioner off, or open the curtains."
             ),
             "parameters": {
                 "type": "object",
@@ -126,11 +129,12 @@ def register(ctx) -> None:
         schema={
             "name": "switchbot_watch",
             "description": (
-                "Read meters (including WoIOSensor), contact sensors, and plugs and compare them with the previous sample. "
+                "SwitchBot: tell when a meter, contact, or plug changes. "
                 "Reports a temperature, humidity, or plug-weight threshold only when config sets one, "
                 "and reports contact openState or the plain Plug power field only after it changes. "
                 "It does not report Plug Mini on or off. Does not send a command. Takes no arguments. "
-                "A chat, slash, or CLI check does not update the cron watch. Only a cron turn writes watch.json and watch_fail.json."
+                "A chat, slash, or CLI check does not update the cron watch. Only a cron turn writes watch.json and watch_fail.json. "
+                "A contact sensor and an infrared remote are devices this watch can notice."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -207,6 +211,19 @@ def register(ctx) -> None:
         handler_fn=_cli,
         description="Read the SwitchBot OpenAPI. Commands stay on the tool, which asks for approval.",
     )
+    try:
+        from pathlib import Path
+        ctx.register_skill(
+            "switchbot-devices",
+            Path(__file__).resolve().parent / "skills" / "switchbot-devices" / "SKILL.md",
+            description=(
+                "SwitchBot devices, meters, and commands. "
+                "Before web_search, use tool_search to find the SwitchBot tools and tool_call to run them."
+            ),
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("switchbot skill was not registered", exc_info=True)
 
 
 __all__ = ["register"]

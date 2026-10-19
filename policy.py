@@ -112,12 +112,24 @@ def prepare_command(command: str, parameter: str | None) -> tuple[str, str] | st
             return command, "default"
         return f"'{command}' only accepts parameter default. Nothing was sent."
     if command == "setPosition":
-        match = _POSITION.fullmatch(parameter or "")
+        raw = parameter or ""
+        if not raw.strip():
+            return "setPosition expects 0,ff,0 through 0,ff,100 (mode 0, 1, or ff). Nothing was sent."
+        if raw.split(",", 1)[0] != "0":
+            return (
+                "setPosition's first value is the curtain index and must be 0. "
+                "Send 0, then the mode (0, 1, or ff), then a position from 0 to 100, "
+                "for example 0,ff,40. Nothing was sent."
+            )
+        match = _POSITION.fullmatch(raw)
         if not match:
             return "setPosition expects 0,ff,0 through 0,ff,100 (mode 0, 1, or ff). Nothing was sent."
         position = int(match.group(2))
         if position > 100:
-            return "setPosition only accepts a position from 0 to 100. Nothing was sent."
+            return (
+                "setPosition only accepts a position from 0 to 100, so pass a position in that range, "
+                "for example 0,ff,0."
+            )
         return command, parameter or ""
     if command == "setAll":
         match = _SET_ALL.fullmatch(parameter or "")

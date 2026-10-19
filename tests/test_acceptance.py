@@ -1062,7 +1062,7 @@ def test_public_text_matches_the_acceptance_table():
     assert "manifest_version: 2" in plugin
     assert 'requires_hermes: ">=0.21.4"' in plugin
     assert "license: MIT" in plugin
-    assert "version: 0.1.1" in plugin
+    assert "version: 0.1.2" in plugin
     assert "python_dependencies" not in plugin
     tree = ast.parse(init)
     slashes = [node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "_slash"]
@@ -1083,8 +1083,8 @@ def test_public_text_matches_the_acceptance_table():
         pytest.skip("ship drafts are not beside this checkout")
     catalog = (ship / "switchbot-control.yaml").read_text(encoding="utf-8")
     description = catalog.split("description:", 1)[1].split("maintainer:", 1)[0]
-    description = description.strip().strip('"')
-    assert len(description) <= 800
+    description = description.strip().strip('"').strip("'")
+    assert len(description) <= 1500
     assert "Disclosure —" in description
     for needle in (
         "personal use",

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ if __package__:
     from .client import ApiError, SwitchBot, redact
     from .policy import (
         DAILY_CAP_LIMIT,
+        DEFAULT_COMMANDS,
         DEFAULT_MAX_STATUS,
         DEVICE_ID,
         MAX_STATUS_HI,
@@ -32,6 +34,7 @@ else:
     from client import ApiError, SwitchBot, redact
     from policy import (
         DAILY_CAP_LIMIT,
+        DEFAULT_COMMANDS,
         DEFAULT_MAX_STATUS,
         DEVICE_ID,
         MAX_STATUS_HI,
@@ -121,9 +124,75 @@ def dumps(payload: dict) -> str:
 
 
 def fail(code: str, message: str, next_step: str, **extra: Any) -> str:
-    body = {"ok": False, "error": code, "message": message, "next_step": next_step, "moved": False}
+    body = {
+        "ok": False, "error": code, "error_type": code,
+        "message": message, "next_step": next_step, "moved": False,
+    }
     body.update(extra)
     return dumps(body)
+
+
+_COMMAND_CATALOG = tuple(sorted(
+    set(DEFAULT_COMMANDS) | set(SAFETY_COMMANDS) | {"setPosition", "setAll", "SetChannel"},
+))
+
+
+def _fold_device_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return unicodedata.normalize("NFKC", value).strip()
+
+
+def _canonical_command(name: Any) -> str | None:
+    if not isinstance(name, str):
+        return None
+    text = unicodedata.normalize("NFKC", name).strip()
+    exact = [item for item in _COMMAND_CATALOG if item == text]
+    if len(exact) == 1:
+        return exact[0]
+    matches = [item for item in _COMMAND_CATALOG if item.lower() == text.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _integral_token(token: str) -> int | None:
+    text = token.strip()
+    if text.isdigit():
+        return int(text)
+    if text.endswith(".0") and text[:-2].isdigit():
+        return int(text[:-2])
+    return None
+
+
+def _fold_parameter(command: str, parameter: str | None) -> str | None:
+    if parameter is None:
+        return None
+    text = unicodedata.normalize("NFKC", parameter).strip()
+    if command in DEFAULT_COMMANDS or command in SAFETY_COMMANDS:
+        if text.lower() == "default":
+            return "default"
+        return text
+    if command == "setPosition":
+        parts = text.split(",")
+        if len(parts) == 3 and parts[0] == "0" and parts[1] in {"0", "1", "ff"}:
+            position = _integral_token(parts[2])
+            if position is not None:
+                return f"0,{parts[1]},{position}"
+        return text
+    if command == "setAll":
+        parts = text.split(",")
+        if len(parts) == 4 and parts[3] in {"on", "off"}:
+            temperature = _integral_token(parts[0])
+            if temperature is not None:
+                return f"{temperature},{parts[1]},{parts[2]},{parts[3]}"
+        return text
+    if command == "SetChannel":
+        channel = _integral_token(text)
+        if channel is not None:
+            return str(channel)
+        return text
+    return text
 
 
 def _shown(deps: Deps, text: str) -> str:
@@ -181,10 +250,9 @@ def deps_from_config(get_config: Callable[[str, Any], Any], *, token: str, secre
     )
 
 
-def _unexpected(args: dict, allowed: set[str]) -> str | None:
-    extra = sorted(set(args) - allowed)
-    if extra:
-        return fail("bad_args", f"Unexpected arguments: {', '.join(extra)}.", "Remove those arguments and try again.")
+def _unexpected(args: dict, allowed: set[str], message: str) -> str | None:
+    if set(args) - allowed:
+        return fail("bad_args", message, message)
     return None
 
 
@@ -296,13 +364,25 @@ def _configured(deps: Deps) -> str | None:
     return None
 
 
+_DEVICES_EXTRA = (
+    "switchbot_devices accepts only device_id, so drop other arguments and call again, for example device_id BOT1."
+)
+_DEVICE_ID_BAD = (
+    "device_id must be letters, digits, and hyphens, at most 64 characters, so use an id from the account list, "
+    "for example device_id BOT1."
+)
+
+
 def devices(deps: Deps, args: dict) -> str:
-    bad = _unexpected(args or {}, {"device_id"}) or _configured(deps)
+    args = dict(args or {})
+    bad = _unexpected(args, {"device_id"}, _DEVICES_EXTRA) or _configured(deps)
     if bad:
         return bad
-    device_id = (args or {}).get("device_id")
-    if device_id is not None and (not isinstance(device_id, str) or not DEVICE_ID.fullmatch(device_id)):
-        return fail("bad_device", "device_id must be letters, digits, and hyphens, at most 64 characters.", "Use an id from the account list. No API call was made.")
+    device_id = args.get("device_id")
+    if device_id is not None:
+        device_id = _fold_device_id(device_id)
+        if device_id is None or not DEVICE_ID.fullmatch(device_id):
+            return fail("bad_device", _DEVICE_ID_BAD, _DEVICE_ID_BAD)
     try:
         listed = _call(deps, "GET", "/v1.1/devices")
         body = listed.get("body")
@@ -356,22 +436,42 @@ def _find(listed: dict, device_id: str) -> dict | None:
     return None
 
 
+_COMMAND_EXTRA = (
+    "switchbot_command accepts only device_id, command, and parameter, so drop other arguments and call again, "
+    "for example command turnOn."
+)
+_COMMAND_MISSING = (
+    "device_id and command are required, so pass both, for example device_id BOT1 and command turnOn."
+)
+_COMMAND_BAD = (
+    "command must be a documented command such as turnOn, pause, or Pause, so pass one of those, "
+    "for example command turnOn."
+)
+_PARAMETER_BAD = (
+    "parameter must be a string such as default or 0,ff,0, so pass one of those, for example parameter default."
+)
+
+
 def command(deps: Deps, args: dict) -> str:
-    bad = _unexpected(args or {}, {"device_id", "command", "parameter"}) or _configured(deps)
+    args = dict(args or {})
+    bad = _unexpected(args, {"device_id", "command", "parameter"}, _COMMAND_EXTRA) or _configured(deps)
     if bad:
         return bad
-    device_id = (args or {}).get("device_id")
-    name = (args or {}).get("command")
-    parameter = (args or {}).get("parameter")
-    if not isinstance(device_id, str) or not DEVICE_ID.fullmatch(device_id):
-        return fail("bad_device", "device_id must be letters, digits, and hyphens, at most 64 characters.", "No API call was made.")
-    if not isinstance(name, str):
-        return fail("bad_command", "command must be a string from the command list.", "No API call was made.")
+    if "device_id" not in args or "command" not in args:
+        return fail("bad_args", _COMMAND_MISSING, _COMMAND_MISSING)
+    device_id = _fold_device_id(args.get("device_id"))
+    name = _canonical_command(args.get("command"))
+    parameter = args.get("parameter")
+    if device_id is None or not DEVICE_ID.fullmatch(device_id):
+        return fail("bad_device", _DEVICE_ID_BAD, _DEVICE_ID_BAD)
+    if name is None:
+        return fail("bad_command", _COMMAND_BAD, _COMMAND_BAD)
     if parameter is not None and not isinstance(parameter, str):
-        return fail("bad_command", "parameter must be a string.", "No API call was made.")
+        return fail("bad_command", _PARAMETER_BAD, _PARAMETER_BAD)
+    parameter = _fold_parameter(name, parameter if isinstance(parameter, str) else None)
     prepared = prepare_command(name, parameter)
     if isinstance(prepared, str):
-        return fail("bad_command", prepared, "No API call was made.")
+        return fail("bad_command", prepared, prepared)
     command_name, command_parameter = prepared
     if command_name in SAFETY_COMMANDS and not deps.safety_devices:
         return fail(
@@ -628,8 +728,11 @@ def _is_cron_turn() -> bool:
     return cron_mark() == "cron"
 
 
+_WATCH_ARGS = "switchbot_watch takes no arguments, so call it with an empty object, for example {}."
+
+
 def watch(deps: Deps, args: dict, *, advance: bool = True) -> str:
-    unexpected = _unexpected(args or {}, set())
+    unexpected = _unexpected(args or {}, set(), _WATCH_ARGS)
     if unexpected:
         body = json.loads(unexpected)
         body["notify"] = False
@@ -889,7 +992,17 @@ def _builtin_deliver_platforms() -> set[str]:
 
 
 def _plugin_deliver_names() -> set[str]:
-    """Loaded platforms Hermes will deliver. A registry name without cron_deliver_env_var is not delivered."""
+    """Loaded platforms Hermes will deliver. A registry name without cron_deliver_env_var is not delivered.
+
+    Current Hermes lists only webhook and wecom_callback in
+    ``_KNOWN_DELIVERY_PLATFORMS``. Telegram and the other chats are plugin
+    platforms, and the registry stays empty until ``discover_plugins()``.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception:
+        pass
     try:
         from gateway.platform_registry import platform_registry
     except Exception:
